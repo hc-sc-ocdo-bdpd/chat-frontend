@@ -1,0 +1,21 @@
+name: foundry-chat-python
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: foundry-chat-python
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+      APP_DATA_DIR: /app/data
+      APP_CONFIG: /app/config/models.yaml
+    ports:
+      - "127.0.0.1:3000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro

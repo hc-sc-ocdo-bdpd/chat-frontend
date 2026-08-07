@@ -1,0 +1,31 @@
+app:
+  title: Foundry Chat
+  default_instructions: >-
+    You are a helpful assistant. Use available tools when they materially help.
+    Focus on the user's requested outcome.
+
+connection:
+  id: azure-openai
+  name: Azure OpenAI
+  api_key_env: AZURE_OPENAI_API_KEY
+
+model_defaults:
+  reasoning_efforts:
+    - auto
+    - none
+    - low
+    - medium
+    - high
+    - xhigh
+    - max
+  default_reasoning_effort: medium
+  verbosity_options:
+    - low
+    - medium
+    - high
+  default_verbosity: medium
+  supports_code_interpreter: true
+  default_code_interpreter: true
+  supports_web_search: true
+  default_web_search: false
+  default_max_output_tokens: 16384

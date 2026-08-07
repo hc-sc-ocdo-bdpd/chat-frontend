@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Foundry Chat</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <button id="new-chat" class="new-chat">＋ New chat</button>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="sidebar-section-heading">
+          <span>Projects</span>
+          <button id="add-project" class="mini-button" title="New project">＋</button>
+        </div>
+        <button id="all-chats-filter" class="sidebar-filter active">All chats</button>
+        <button id="general-chats-filter" class="sidebar-filter">General</button>
+        <div id="project-list" class="project-list"></div>
+      </div>
+
+      <div class="sidebar-section conversations-section">
+        <div class="sidebar-section-heading">
+          <span>Chats</span>
+          <span id="conversation-count" class="sidebar-count"></span>
+        </div>
+        <div id="conversation-list" class="conversation-list"></div>
+      </div>
+
+      <div class="sidebar-footer">
+        <span>Local app</span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <button id="sidebar-toggle" class="icon-button mobile-only" title="Toggle sidebar">☰</button>
+        <div id="active-project-badge" class="active-project-badge hidden"></div>
+        <div class="selectors">
+          <label>
+            <span>Model</span>
+            <select id="model-select"></select>
+          </label>
+          <label>
+            <span>Reasoning</span>
+            <select id="reasoning-select"></select>
+          </label>
+          <label>
+            <span>Verbosity</span>
+            <select id="verbosity-select"></select>
+          </label>
+        </div>
+        <button id="settings-toggle" class="icon-button" title="Settings">⚙</button>
+      </header>
+
+      <section id="settings-panel" class="settings-panel hidden">
+        <details id="web-search-options" class="web-search-options advanced-search-options">
+          <summary>Web research settings</summary>
+          <label class="settings-field">
+            <span>Allowed domains, optional</span>
+            <textarea id="web-allowed-domains" rows="3" placeholder="learn.microsoft.com&#10;github.com"></textarea>
+          </label>
+          <label class="settings-field">
+            <span>Blocked domains, optional</span>
+            <textarea id="web-blocked-domains" rows="3" placeholder="pinterest.com"></textarea>
+          </label>
+          <p class="web-privacy-note">
+            Web research always uses the thorough, high-context mode. Queries use
+            Azure Grounding with Bing. Do not enable it for sensitive project
+            content without the required organizational approval.
+          </p>
+        </details>
+
+        <label class="token-row">
+          <span>Max output tokens</span>
+          <input id="max-output-tokens" type="number" min="256" max="128000" step="256">
+        </label>
+      </section>
+
+      <section id="messages" class="messages">
+        <div class="welcome" id="welcome">
+          <h1>Foundry Chat</h1>
+          <p>Select a model, attach files, and start a conversation.</p>
+        </div>
+      </section>
+
+      <section class="composer-shell">
+        <div id="project-context" class="project-context hidden"></div>
+        <div id="pending-files" class="pending-files"></div>
+        <div class="composer">
+          <textarea id="message-input" rows="1" placeholder="Message Foundry Chat"></textarea>
+          <div class="composer-footer">
+            <div class="composer-controls">
+              <label class="composer-attach" title="Attach files">
+                <input id="file-input" type="file" multiple>
+                <span class="composer-control-content" aria-hidden="true">📎</span>
+                <span class="sr-only">Attach files</span>
+              </label>
+
+              <label class="composer-tool" title="Let Azure Code Interpreter inspect files, run Python, and create files">
+                <input type="checkbox" id="code-interpreter">
+                <span class="composer-tool-content"><span aria-hidden="true">&lt;/&gt;</span> Code</span>
+              </label>
+
+              <label class="composer-tool" title="Perform thorough Azure web research with sources">
+                <input type="checkbox" id="web-search">
+                <span class="composer-tool-content"><span aria-hidden="true">◎</span> Web research</span>
+              </label>
+            </div>
+            <button id="send-button" class="send-button" title="Send">↑</button>
+          </div>
+        </div>
+        <div id="composer-note" class="composer-note">
+          Tools are applied to this message. Verify important output.
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="project-modal" class="modal-backdrop hidden">
+    <section class="modal-card project-modal-card" role="dialog" aria-modal="true" aria-labelledby="project-modal-title">
+      <div class="modal-header">
+        <h2 id="project-modal-title">Project</h2>
+        <button id="project-modal-close" class="icon-button" title="Close">×</button>
+      </div>
+
+      <div class="modal-body">
+        <label class="form-field">
+          <span>Name</span>
+          <input id="project-name" type="text" maxlength="120">
+        </label>
+
+        <label class="form-field">
+          <span>Project instructions</span>
+          <textarea id="project-instructions" rows="7" maxlength="20000" placeholder="Instructions applied to every chat in this project"></textarea>
+        </label>
+
+        <label class="form-field">
+          <span>Default model</span>
+          <select id="project-model"></select>
+        </label>
+
+        <div class="project-files-header">
+          <div>
+            <h3>Project files</h3>
+            <p>Active files are automatically available in every project chat.</p>
+          </div>
+          <label class="secondary-button">
+            Add files
+            <input id="project-file-input" type="file" multiple>
+          </label>
+        </div>
+        <div id="project-files-list" class="project-files-list"></div>
+      </div>
+
+      <div class="modal-footer">
+        <button id="delete-project" class="danger-button">Delete project</button>
+        <div class="modal-footer-spacer"></div>
+        <button id="cancel-project" class="secondary-button">Cancel</button>
+        <button id="save-project" class="primary-button">Save project</button>
+      </div>
+    </section>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: {'[+]': [['$', '$'], ['\\(', '\\)']]},
+        displayMath: {'[+]': [['$$', '$$'], ['\\[', '\\]']]}
+      },
+      svg: {fontCache: 'global'},
+      startup: {typeset: false}
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@4/tex-svg.js"></script>
+  <script defer src="/static/app.js"></script>
+</body>
+</html>

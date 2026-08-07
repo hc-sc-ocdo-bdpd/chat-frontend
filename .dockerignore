@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+.venv/
+data/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.zip
+.vscode/
+.idea/
