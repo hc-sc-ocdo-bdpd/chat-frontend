@@ -44,9 +44,11 @@ class MessageCreate(BaseModel):
     endpoint_id: str | None = None
     reasoning_effort: str = "auto"
     verbosity: str = "medium"
+    # GPT-5.6 and GPT-6 Astra currently cap a single response at 128k output
+    # tokens. Long answers are automatically chained by the provider layer.
     max_output_tokens: int = Field(default=16384, ge=256, le=128000)
     use_code_interpreter: bool = True
-    use_web_search: bool = False
+    use_web_search: bool = True
     research_depth: Literal["quick", "thorough"] = "thorough"
     web_allowed_domains: list[str] = Field(default_factory=list, max_length=100)
     web_blocked_domains: list[str] = Field(default_factory=list, max_length=100)
@@ -57,7 +59,7 @@ class PartialAssistantCreate(BaseModel):
     content: str = ""
     model_id: str | None = None
     endpoint_id: str | None = None
-    use_web_search: bool = False
+    use_web_search: bool = True
     research_depth: Literal["quick", "thorough"] = "thorough"
     reasoning_summary: str = ""
     activities: list[str] = Field(default_factory=list)

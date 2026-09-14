@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterable
 
 import httpx
@@ -253,6 +256,9 @@ def build_response_arguments(
 
     if stream:
         arguments["stream"] = True
+        # Background streaming gives Azure a durable response ID that can be
+        # resumed if the HTTP connection drops mid-generation.
+        arguments["background"] = True
 
     return arguments
 
@@ -293,6 +299,238 @@ def create_response(
     return client.responses.create(**arguments)
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+class CombinedResponse:
+    """Expose multiple chained Responses as one final response to the app."""
+
+    def __init__(self, responses: list[Any], final_response: Any) -> None:
+        self._responses = [*responses, final_response]
+        self._final = final_response
+        self.id = getattr(final_response, "id", "")
+        self.output_text = "".join(
+            str(getattr(response, "output_text", "") or "")
+            for response in self._responses
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._final, name)
+
+    def model_dump(self) -> dict[str, Any]:
+        final_raw = self._final.model_dump()
+        combined_output: list[Any] = []
+        for response in self._responses:
+            raw = response.model_dump()
+            output = raw.get("output") if isinstance(raw, dict) else None
+            if isinstance(output, list):
+                combined_output.extend(output)
+        final_raw["output"] = combined_output
+        final_raw["id"] = self.id
+        return final_raw
+
+
+class ResumableResponseStream:
+    """Durable Azure Responses stream with transparent reconnects.
+
+    Azure background streams can be resumed from a response ID and event
+    sequence number. This wrapper keeps the existing iterator interface used by
+    main.py while recovering from dropped/chunk-truncated HTTP connections.
+
+    A single GPT-5.6 / GPT-6 Astra response is capped at 128k output tokens. If
+    Azure ends a response with ``max_output_tokens``, transparently chain a
+    continuation response so the UI can receive a longer logical answer.
+    """
+
+    def __init__(self, client: Any, arguments: dict[str, Any]) -> None:
+        self.client = client
+        self.base_arguments = dict(arguments)
+        self.current_stream: Any | None = None
+        self.current_iterator: Any | None = None
+        self.response_id: str | None = None
+        self.sequence_number: int | None = None
+        self.terminal = False
+        self.closed = False
+        self.resume_failures = 0
+        self.continuations = 0
+        self.prior_responses: list[Any] = []
+        self.max_resume_attempts = _positive_int_env(
+            "APP_STREAM_RESUME_ATTEMPTS", 8
+        )
+        self.max_continuations = _positive_int_env(
+            "APP_MAX_AUTO_CONTINUATIONS", 3
+        )
+        self._start(self.base_arguments)
+
+    def __iter__(self) -> "ResumableResponseStream":
+        return self
+
+    def _close_current(self) -> None:
+        if self.current_stream is None:
+            return
+        close = getattr(self.current_stream, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        self.current_stream = None
+        self.current_iterator = None
+
+    def _start(self, arguments: dict[str, Any]) -> None:
+        self._close_current()
+        self.current_stream = self.client.responses.create(**arguments)
+        self.current_iterator = iter(self.current_stream)
+        self.response_id = None
+        self.sequence_number = None
+        self.terminal = False
+        self.resume_failures = 0
+
+    def _resume(self) -> None:
+        if not self.response_id:
+            raise RuntimeError("Cannot resume a response before Azure returned an ID")
+        self._close_current()
+        starting_after = self.sequence_number if self.sequence_number is not None else 0
+        self.current_stream = self.client.responses.retrieve(
+            response_id=self.response_id,
+            stream=True,
+            starting_after=starting_after,
+        )
+        self.current_iterator = iter(self.current_stream)
+
+    @staticmethod
+    def _incomplete_reason(response: Any) -> str:
+        details = getattr(response, "incomplete_details", None)
+        return str(getattr(details, "reason", "") or "")
+
+    def _start_continuation(self, previous_response_id: str) -> None:
+        self.continuations += 1
+        arguments = dict(self.base_arguments)
+        arguments["input"] = (
+            "Continue exactly where the previous response stopped. "
+            "Do not repeat material that was already completed. Finish the "
+            "original user request, preserving the same format and level of detail."
+        )
+        arguments["previous_response_id"] = previous_response_id
+        self._start(arguments)
+
+    def _recover(self, error: Exception | None = None) -> bool:
+        if not self.response_id or self.resume_failures >= self.max_resume_attempts:
+            return False
+        self.resume_failures += 1
+        # Short bounded backoff avoids hammering Azure when a proxy or network
+        # path is briefly unhealthy. The background response keeps running.
+        time.sleep(min(0.4 * (2 ** (self.resume_failures - 1)), 5.0))
+        try:
+            self._resume()
+            return True
+        except Exception:
+            if self.resume_failures >= self.max_resume_attempts:
+                if error is not None:
+                    raise error
+                raise
+            return self._recover(error)
+
+    def __next__(self) -> Any:
+        while not self.closed:
+            try:
+                if self.current_iterator is None:
+                    raise StopIteration
+                event = next(self.current_iterator)
+            except StopIteration:
+                if self.terminal:
+                    raise
+                if self._recover():
+                    continue
+                raise RuntimeError(
+                    "The Azure response stream ended before a terminal event "
+                    "and could not be resumed"
+                )
+            except Exception as exc:
+                if self._recover(exc):
+                    continue
+                raise
+
+            event_type = str(getattr(event, "type", ""))
+            sequence_number = getattr(event, "sequence_number", None)
+            if isinstance(sequence_number, int):
+                self.sequence_number = sequence_number
+                self.resume_failures = 0
+
+            response = getattr(event, "response", None)
+            response_id = getattr(response, "id", None)
+            if isinstance(response_id, str) and response_id:
+                self.response_id = response_id
+
+            if event_type == "response.created":
+                self.terminal = False
+                return event
+
+            if event_type == "response.incomplete":
+                reason = self._incomplete_reason(response)
+                if (
+                    reason == "max_output_tokens"
+                    and self.response_id
+                    and self.continuations < self.max_continuations
+                ):
+                    if response is not None:
+                        self.prior_responses.append(response)
+                    self._start_continuation(self.response_id)
+                    continue
+
+                # main.py currently understands response.completed as the
+                # successful terminal event. Preserve all text already streamed
+                # instead of throwing it away when Azure returns a terminal
+                # incomplete response (for example content filtering or after
+                # the configured continuation ceiling).
+                self.terminal = True
+                return SimpleNamespace(
+                    type="response.completed",
+                    response=response,
+                    sequence_number=self.sequence_number,
+                )
+
+            if event_type == "response.completed":
+                self.terminal = True
+                if self.prior_responses and response is not None:
+                    return SimpleNamespace(
+                        type="response.completed",
+                        response=CombinedResponse(self.prior_responses, response),
+                        sequence_number=self.sequence_number,
+                    )
+
+            if event_type == "response.failed":
+                self.terminal = True
+
+            return event
+
+        raise StopIteration
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self._close_current()
+
+        # Because streamed requests run in background mode, closing the local
+        # stream does not itself stop Azure. Cancel a non-terminal response so a
+        # user pressing Stop, navigating away, or losing the browser connection
+        # does not leave an orphaned billable generation running.
+        if self.response_id and not self.terminal:
+            try:
+                self.client.responses.cancel(self.response_id)
+            except Exception:
+                pass
+
+
 def stream_response(
     *,
     endpoint: EndpointConfig,
@@ -327,7 +565,7 @@ def stream_response(
         previous_response_id=previous_response_id,
         stream=True,
     )
-    return client.responses.create(**arguments)
+    return ResumableResponseStream(client, arguments)
 
 def extract_generated_files(response: Any) -> list[dict[str, str]]:
     raw = response.model_dump()
@@ -517,15 +755,13 @@ def download_generated_file(
     container_id: str,
     file_id: str,
 ) -> httpx.Response:
-    url = (
-        endpoint.base_url.rstrip("/")
-        + f"/containers/{container_id}/files/{file_id}/content"
+    client = make_client(endpoint)
+    upstream = client.containers.files.content.retrieve(
+        file_id=file_id,
+        container_id=container_id,
     )
-    response = httpx.get(
-        url,
-        headers={"api-key": endpoint.api_key},
-        timeout=300.0,
-        follow_redirects=True,
+    return httpx.Response(
+        status_code=200,
+        content=upstream.read(),
+        headers={"content-type": "application/octet-stream"},
     )
-    response.raise_for_status()
-    return response
