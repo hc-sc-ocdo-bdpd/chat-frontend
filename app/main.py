@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import uvicorn
 from dotenv import load_dotenv
@@ -19,9 +19,13 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import AppConfig, EndpointConfig, ModelConfig, load_config
 from .db import Database
+from .jobs import (
+    ACTIVE_GENERATION_STATUSES,
+    TERMINAL_GENERATION_STATUSES,
+    GenerationJob,
+)
 from .provider import (
     build_history_input,
-    create_response,
     download_generated_file,
     extract_generated_files,
     extract_web_research,
@@ -39,7 +43,6 @@ from .schemas import (
     ProjectFileUpdate,
     ProjectUpdate,
 )
-
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
@@ -63,10 +66,31 @@ CONFIG_PATH = os.getenv(
 )
 MAX_UPLOAD_BYTES = int(os.getenv("APP_MAX_UPLOAD_MB", "500")) * 1024 * 1024
 UPLOAD_DIR = DATA_DIR / "uploads"
+GENERATED_DIR = DATA_DIR / "generated"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 
 config: AppConfig = load_config(CONFIG_PATH)
 db = Database(DATA_DIR / "app.db")
+for interrupted_job in db.fail_interrupted_generation_jobs():
+    if interrupted_job.get("assistant_message_id"):
+        continue
+    try:
+        interrupted_message = db.add_message(
+            interrupted_job["conversation_id"],
+            "assistant",
+            "Request interrupted because the application restarted before it finished.",
+            {"error": True, "interrupted": True},
+        )
+        db.update_generation_job(
+            interrupted_job["id"],
+            assistant_message_id=interrupted_message["id"],
+        )
+    except KeyError:
+        logger.warning(
+            "Could not record interrupted generation %s",
+            interrupted_job["id"],
+        )
 provider_reconciliation = db.reconcile_provider_ids(
     valid_models={
         endpoint.id: set(endpoint.models)
@@ -85,8 +109,9 @@ if any(provider_reconciliation.values()):
 app = FastAPI(title=config.title)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-_cancellation_lock = threading.RLock()
-_active_cancellations: dict[str, threading.Event] = {}
+_generation_lock = threading.RLock()
+_generations: dict[str, GenerationJob] = {}
+_active_generation_by_conversation: dict[str, str] = {}
 
 
 def get_endpoint_and_model(
@@ -132,10 +157,6 @@ def validate_message_options(payload: MessageCreate, model: ModelConfig) -> None
             status_code=400,
             detail="Web search is not enabled for this model",
         )
-
-
-def encode_sse(payload: dict[str, Any]) -> str:
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 def stream_event_error(event: Any) -> str:
@@ -194,7 +215,11 @@ def combined_instructions(
 def conversation_context(
     conversation: dict[str, Any],
     payload: MessageCreate,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     attachments: list[dict[str, Any]] = []
     for attachment_id in payload.attachment_ids:
         try:
@@ -214,16 +239,23 @@ def conversation_context(
             conversation["project_id"], active_only=True
         )
 
-    return attachments, project_files
+    retained_generated_files = db.list_generated_files(conversation["id"])
+    return attachments, project_files, retained_generated_files
 
 
 def prepare_provider_files(
     endpoint: EndpointConfig,
     attachments: list[dict[str, Any]],
     project_files: list[dict[str, Any]],
+    generated_files: list[dict[str, Any]],
 ) -> tuple[list[str], list[tuple[dict[str, Any], str]]]:
     provider_file_ids: list[str] = []
     named_provider_files: list[tuple[dict[str, Any], str]] = []
+
+    def add_file(file_row: dict[str, Any], provider_file_id: str) -> None:
+        if provider_file_id not in provider_file_ids:
+            provider_file_ids.append(provider_file_id)
+        named_provider_files.append((file_row, provider_file_id))
 
     for attachment in attachments:
         provider_file_id = attachment["provider_files"].get(endpoint.id)
@@ -236,8 +268,7 @@ def prepare_provider_files(
             db.set_provider_file(
                 attachment["id"], endpoint.id, provider_file_id
             )
-        provider_file_ids.append(provider_file_id)
-        named_provider_files.append((attachment, provider_file_id))
+        add_file(attachment, provider_file_id)
 
     for project_file in project_files:
         provider_file_id = project_file["provider_files"].get(endpoint.id)
@@ -250,8 +281,20 @@ def prepare_provider_files(
             db.set_project_provider_file(
                 project_file["id"], endpoint.id, provider_file_id
             )
-        provider_file_ids.append(provider_file_id)
-        named_provider_files.append((project_file, provider_file_id))
+        add_file(project_file, provider_file_id)
+
+    for generated_file in generated_files:
+        provider_file_id = generated_file["provider_files"].get(endpoint.id)
+        if not provider_file_id:
+            provider_file_id = upload_file(
+                endpoint,
+                GENERATED_DIR / generated_file["stored_name"],
+                generated_file["original_name"],
+            )
+            db.set_generated_provider_file(
+                generated_file["id"], endpoint.id, provider_file_id
+            )
+        add_file(generated_file, provider_file_id)
 
     return provider_file_ids, named_provider_files
 
@@ -291,20 +334,160 @@ def build_input_payload(
     return history, None
 
 
-def generated_downloads(
-    endpoint: EndpointConfig, response: Any
-) -> list[dict[str, str]]:
-    return [
-        {
-            **item,
-            "url": (
-                f"/api/generated/{endpoint.id}/"
-                f"{item['container_id']}/{item['file_id']}"
-                f"?filename={item['filename']}"
-            ),
-        }
-        for item in extract_generated_files(response)
+def generated_file_metadata(
+    conversation_id: str, file_row: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "id": file_row["id"],
+        "filename": file_row["original_name"],
+        "content_type": file_row.get("content_type"),
+        "size_bytes": int(file_row["size_bytes"]),
+        "url": (
+            f"/api/conversations/{conversation_id}/generated-files/"
+            f"{file_row['id']}/download"
+        ),
+    }
+
+
+def persist_generated_files(
+    endpoint: EndpointConfig,
+    response: Any,
+    conversation_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Download generated bytes before Azure's container can expire."""
+    sources = extract_generated_files(response)
+    if not sources:
+        return [], []
+
+    destination_dir = GENERATED_DIR / conversation_id
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, Any]] = []
+
+    try:
+        for source in sources:
+            original_name = sanitize_filename(source["filename"])
+            retained_id = str(uuid.uuid4())
+            stored_name = str(
+                Path(conversation_id) / f"{retained_id}_{original_name}"
+            )
+            destination = GENERATED_DIR / stored_name
+            temporary = destination.with_name(destination.name + ".part")
+
+            last_error: Exception | None = None
+            upstream: Any | None = None
+            for attempt in range(3):
+                try:
+                    upstream = download_generated_file(
+                        endpoint,
+                        source["container_id"],
+                        source["file_id"],
+                    )
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        time.sleep(0.25 * (2**attempt))
+
+            if upstream is None:
+                raise RuntimeError(
+                    f"Could not retain generated file {original_name}: {last_error}"
+                )
+
+            content = bytes(upstream.content)
+            with temporary.open("wb") as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            temporary.replace(destination)
+
+            content_type = upstream.headers.get("content-type")
+            if not content_type or content_type == "application/octet-stream":
+                content_type = mimetypes.guess_type(original_name)[0]
+
+            records.append(
+                {
+                    "id": retained_id,
+                    "original_name": original_name,
+                    "stored_name": stored_name,
+                    "content_type": content_type or "application/octet-stream",
+                    "size_bytes": len(content),
+                    "source_endpoint_id": endpoint.id,
+                    "source_container_id": source["container_id"],
+                    "source_file_id": source["file_id"],
+                    "provider_files": {},
+                    "created_at": time.time(),
+                }
+            )
+    except Exception:
+        for record in records:
+            (GENERATED_DIR / record["stored_name"]).unlink(missing_ok=True)
+        for temporary in destination_dir.glob("*.part"):
+            temporary.unlink(missing_ok=True)
+        raise
+
+    return records, [
+        generated_file_metadata(conversation_id, record) for record in records
     ]
+
+
+def remove_generated_file_bytes(files: list[dict[str, Any]]) -> None:
+    parent_directories: set[Path] = set()
+    for file_row in files:
+        path = GENERATED_DIR / file_row["stored_name"]
+        parent_directories.add(path.parent)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not delete retained file %s", file_row["id"])
+
+    for directory in parent_directories:
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
+def active_generation_snapshot(
+    conversation_id: str, *, include_output: bool = True
+) -> dict[str, Any] | None:
+    with _generation_lock:
+        job_id = _active_generation_by_conversation.get(conversation_id)
+        job = _generations.get(job_id) if job_id else None
+    if job is not None and job.status in ACTIVE_GENERATION_STATUSES:
+        return job.snapshot(include_output=include_output)
+
+    row = db.get_active_generation_job(conversation_id)
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "conversation_id": row["conversation_id"],
+        "status": row["status"],
+        "status_label": row["status_label"],
+        "created_at": row["created_at"],
+        "started_at": row["started_at"],
+        "completed_at": row["completed_at"],
+        "assistant_message_id": row["assistant_message_id"],
+        "error": row["error"],
+        "last_sequence": 0,
+        **(
+            {
+                "assistant_text": "",
+                "reasoning_summary": "",
+                "activities": [],
+            }
+            if include_output
+            else {}
+        ),
+    }
+
+
+def ensure_conversation_idle(conversation_id: str) -> None:
+    if active_generation_snapshot(conversation_id, include_output=False):
+        raise HTTPException(
+            status_code=409,
+            detail="Wait for the active response to finish or stop it first",
+        )
 
 
 async def save_upload(upload: UploadFile) -> tuple[str, str, int, str | None]:
@@ -580,6 +763,7 @@ def get_conversation(conversation_id: str) -> dict[str, Any]:
         **conversation,
         "messages": db.list_messages(conversation_id),
         "attachments": db.list_attachments(conversation_id),
+        "generation": active_generation_snapshot(conversation_id),
         "project": project,
         "project_files": (
             db.list_project_files(conversation["project_id"])
@@ -587,6 +771,15 @@ def get_conversation(conversation_id: str) -> dict[str, Any]:
             else []
         ),
     }
+
+
+@app.post("/api/conversations/{conversation_id}/read")
+def mark_conversation_read(conversation_id: str) -> dict[str, bool]:
+    try:
+        db.mark_conversation_read(conversation_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"read": True}
 
 
 @app.patch("/api/conversations/{conversation_id}")
@@ -613,8 +806,10 @@ def update_conversation(
 
 @app.delete("/api/conversations/{conversation_id}")
 def delete_conversation(conversation_id: str) -> dict[str, bool]:
+    ensure_conversation_idle(conversation_id)
     try:
         attachments = db.list_attachments(conversation_id)
+        generated_files = db.list_generated_files(conversation_id)
         db.delete_conversation(conversation_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -624,6 +819,7 @@ def delete_conversation(conversation_id: str) -> dict[str, bool]:
             (UPLOAD_DIR / attachment["stored_name"]).unlink(missing_ok=True)
         except OSError:
             logger.warning("Could not delete local attachment %s", attachment["id"])
+    remove_generated_file_bytes(generated_files)
     return {"deleted": True}
 
 
@@ -631,6 +827,7 @@ def delete_conversation(conversation_id: str) -> dict[str, bool]:
 def branch_conversation(
     conversation_id: str, message_id: str
 ) -> dict[str, Any]:
+    ensure_conversation_idle(conversation_id)
     try:
         source = db.get_conversation(conversation_id)
         source_messages = db.list_messages_through(conversation_id, message_id)
@@ -685,13 +882,56 @@ def branch_conversation(
                 for item in metadata["attachment_ids"]
                 if item in attachment_map
             ]
-        db.add_message(
-            branch["id"],
-            message["role"],
-            message["content"],
-            metadata,
-            created_at=message["created_at"],
-        )
+        copied_generated_files: list[dict[str, Any]] = []
+        copied_paths: list[Path] = []
+        metadata.pop("generated_files", None)
+
+        for source_file in db.list_message_generated_files(message["id"]):
+            source_path = GENERATED_DIR / source_file["stored_name"]
+            if not source_path.exists():
+                logger.warning(
+                    "Could not copy missing retained file %s while branching",
+                    source_file["id"],
+                )
+                continue
+
+            copied_id = str(uuid.uuid4())
+            original_name = sanitize_filename(source_file["original_name"])
+            copied_stored_name = str(
+                Path(branch["id"]) / f"{copied_id}_{original_name}"
+            )
+            destination = GENERATED_DIR / copied_stored_name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, destination)
+            copied_paths.append(destination)
+            copied_generated_files.append(
+                {
+                    **source_file,
+                    "id": copied_id,
+                    "stored_name": copied_stored_name,
+                    "created_at": source_file["created_at"],
+                }
+            )
+
+        if copied_generated_files:
+            metadata["generated_files"] = [
+                generated_file_metadata(branch["id"], file_row)
+                for file_row in copied_generated_files
+            ]
+
+        try:
+            db.add_message(
+                branch["id"],
+                message["role"],
+                message["content"],
+                metadata,
+                created_at=message["created_at"],
+                generated_files=copied_generated_files,
+            )
+        except Exception:
+            for copied_path in copied_paths:
+                copied_path.unlink(missing_ok=True)
+            raise
 
     last_message = source_messages[-1] if source_messages else None
     if last_message and last_message["role"] == "assistant":
@@ -713,10 +953,15 @@ def branch_conversation(
 def delete_messages_from(
     conversation_id: str, message_id: str
 ) -> dict[str, Any]:
+    ensure_conversation_idle(conversation_id)
     try:
+        generated_files = db.list_generated_files_from_message(
+            conversation_id, message_id
+        )
         deleted_count = db.truncate_messages_from(conversation_id, message_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Message not found")
+    remove_generated_file_bytes(generated_files)
     return {
         "deleted_count": deleted_count,
         "conversation": get_conversation(conversation_id),
@@ -785,377 +1030,151 @@ async def create_attachments(
 # ---------------------------------------------------------------------------
 
 
-@app.post("/api/conversations/{conversation_id}/cancel")
-def cancel_generation(conversation_id: str) -> dict[str, bool]:
-    try:
-        db.get_conversation(conversation_id)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+def _finish_cancelled_generation(
+    *,
+    job: GenerationJob,
+    endpoint: EndpointConfig,
+    model: ModelConfig,
+    payload: MessageCreate,
+    assistant_text: str,
+    reasoning_summary: str,
+    activities: list[str],
+    started_monotonic: float,
+) -> None:
+    duration_seconds = round(time.monotonic() - started_monotonic, 1)
+    assistant_message = None
+    if assistant_text.strip():
+        assistant_message = db.add_message(
+            job.conversation_id,
+            "assistant",
+            assistant_text,
+            {
+                "endpoint_id": endpoint.id,
+                "model_id": model.id,
+                "reasoning_summary": reasoning_summary,
+                "activities": activities,
+                "duration_seconds": duration_seconds,
+                "web_search_enabled": payload.use_web_search,
+                "research_depth": payload.research_depth,
+                "stopped": True,
+            },
+        )
 
-    with _cancellation_lock:
-        cancellation = _active_cancellations.get(conversation_id)
-        if cancellation is not None:
-            cancellation.set()
-            return {"cancelled": True}
-    return {"cancelled": False}
-
-
-@app.post("/api/conversations/{conversation_id}/messages/stream")
-def stream_message(
-    conversation_id: str, payload: MessageCreate
-) -> StreamingResponse:
-    try:
-        conversation = db.get_conversation(conversation_id)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-
-    endpoint, model = normalize_message_provider(payload)
-    validate_message_options(payload, model)
-    attachments, project_files = conversation_context(conversation, payload)
-
-    user_message = db.add_message(
-        conversation_id,
-        "user",
-        payload.content.strip(),
+    db.clear_response_link(job.conversation_id)
+    completed_at = time.time()
+    db.update_generation_job(
+        job.id,
+        assistant_message_id=(
+            assistant_message["id"] if assistant_message is not None else None
+        ),
+        status="cancelled",
+        status_label="Stopped",
+        completed_at=completed_at,
+    )
+    job.publish(
         {
-            "attachment_ids": payload.attachment_ids,
-            "project_file_ids": [item["id"] for item in project_files],
-            "endpoint_id": config.default_endpoint,
-            "model_id": payload.model_id or config.default_model,
-            "use_web_search": payload.use_web_search,
-            "research_depth": payload.research_depth,
-        },
+            "type": "cancelled",
+            "assistant_message": assistant_message,
+            "duration_seconds": duration_seconds,
+            "completed_at": completed_at,
+        }
     )
 
-    if conversation["title"] == "New chat":
-        new_title = payload.content.strip().replace("\n", " ")[:70]
-        db.update_conversation(conversation_id, title=new_title or "New chat")
 
-    cancellation = threading.Event()
-    with _cancellation_lock:
-        previous_cancellation = _active_cancellations.get(conversation_id)
-        if previous_cancellation is not None:
-            previous_cancellation.set()
-        _active_cancellations[conversation_id] = cancellation
+def _run_generation_job(
+    *,
+    job: GenerationJob,
+    conversation: dict[str, Any],
+    payload: MessageCreate,
+    endpoint: EndpointConfig,
+    model: ModelConfig,
+    attachments: list[dict[str, Any]],
+    project_files: list[dict[str, Any]],
+    retained_generated_files: list[dict[str, Any]],
+) -> None:
+    started_monotonic = time.monotonic()
+    started_at = time.time()
+    reasoning_summary = ""
+    assistant_text = ""
+    activities: list[str] = []
+    final_response: Any | None = None
+    provider_stream: Any | None = None
 
-    def generate() -> Iterator[str]:
-        started_at = time.monotonic()
-        reasoning_summary = ""
-        assistant_text = ""
-        activities: list[str] = []
-        final_response: Any | None = None
-        provider_stream: Any | None = None
+    def activity(label: str) -> None:
+        if label in activities:
+            return
+        activities.append(label)
+        job.publish({"type": "activity", "label": label})
 
-        def activity(label: str) -> str | None:
-            if label in activities:
-                return None
-            activities.append(label)
-            return encode_sse({"type": "activity", "label": label})
+    try:
+        db.update_generation_job(
+            job.id,
+            status="running",
+            status_label="Thinking",
+            started_at=started_at,
+        )
+        job.publish(
+            {
+                "type": "started",
+                "label": "Thinking",
+                "user_message": job.user_message,
+                "started_at": started_at,
+                "project_file_count": len(project_files),
+                "retained_file_count": len(retained_generated_files),
+            }
+        )
 
-        try:
-            yield encode_sse(
-                {
-                    "type": "started",
-                    "user_message": user_message,
-                    "started_at": time.time(),
-                    "project_file_count": len(project_files),
-                }
-            )
-
-            if attachments or project_files:
-                yield encode_sse(
-                    {
-                        "type": "status",
-                        "label": "Preparing attached files",
-                    }
-                )
-
-            provider_file_ids, named_provider_files = prepare_provider_files(
-                endpoint, attachments, project_files
-            )
-            input_payload, previous_response_id = build_input_payload(
-                conversation=conversation,
-                payload=payload,
-                named_provider_files=named_provider_files,
-            )
-
-            yield encode_sse({"type": "status", "label": "Thinking"})
-
-            provider_stream = stream_response(
+        if job.cancel_event.is_set():
+            _finish_cancelled_generation(
+                job=job,
                 endpoint=endpoint,
                 model=model,
-                input_payload=input_payload,
-                instructions=combined_instructions(conversation, payload),
-                reasoning_effort=payload.reasoning_effort,
-                verbosity=payload.verbosity,
-                max_output_tokens=payload.max_output_tokens,
-                use_code_interpreter=(
-                    payload.use_code_interpreter or bool(provider_file_ids)
-                ),
-                provider_file_ids=provider_file_ids,
-                use_web_search=payload.use_web_search,
-                research_depth=payload.research_depth,
-                web_allowed_domains=payload.web_allowed_domains,
-                web_blocked_domains=payload.web_blocked_domains,
-                previous_response_id=previous_response_id,
+                payload=payload,
+                assistant_text=assistant_text,
+                reasoning_summary=reasoning_summary,
+                activities=activities,
+                started_monotonic=started_monotonic,
             )
+            return
 
-            for event in provider_stream:
-                if cancellation.is_set():
-                    logger.info("Generation cancelled for %s", conversation_id)
-                    return
-
-                event_type = str(getattr(event, "type", ""))
-
-                if event_type in {
-                    "response.reasoning_summary_text.delta",
-                    "response.reasoning_summary.delta",
-                }:
-                    delta = str(getattr(event, "delta", "") or "")
-                    if delta:
-                        reasoning_summary += delta
-                        yield encode_sse(
-                            {"type": "reasoning_delta", "delta": delta}
-                        )
-                    continue
-
-                if event_type in {
-                    "response.reasoning_summary_text.done",
-                    "response.reasoning_summary.done",
-                }:
-                    complete_text = str(getattr(event, "text", "") or "")
-                    if complete_text:
-                        reasoning_summary = complete_text
-                        yield encode_sse(
-                            {"type": "reasoning_done", "text": complete_text}
-                        )
-                    continue
-
-                if event_type == "response.code_interpreter_call.in_progress":
-                    encoded = activity("Starting Code Interpreter")
-                    if encoded:
-                        yield encoded
-                    continue
-
-                if event_type == "response.code_interpreter_call_code.delta":
-                    encoded = activity("Writing Python")
-                    if encoded:
-                        yield encoded
-                    continue
-
-                if event_type == "response.code_interpreter_call.interpreting":
-                    encoded = activity("Running Python")
-                    if encoded:
-                        yield encoded
-                    continue
-
-                if event_type == "response.code_interpreter_call.completed":
-                    encoded = activity("Code Interpreter finished")
-                    if encoded:
-                        yield encoded
-                    continue
-
-                if event_type == "response.web_search_call.in_progress":
-                    encoded = activity("Starting web search")
-                    if encoded:
-                        yield encoded
-                    continue
-
-                if event_type == "response.web_search_call.searching":
-                    encoded = activity("Searching the web")
-                    if encoded:
-                        yield encoded
-                    continue
-
-                if event_type == "response.web_search_call.completed":
-                    encoded = activity("Web search finished")
-                    if encoded:
-                        yield encoded
-                    continue
-
-                if event_type == "response.output_item.done":
-                    item = getattr(event, "item", None)
-                    try:
-                        item_raw = item.model_dump() if item is not None else {}
-                    except Exception:
-                        item_raw = {}
-                    if item_raw.get("type") == "web_search_call":
-                        action = item_raw.get("action") or {}
-                        action_type = action.get("type")
-                        if action_type == "search" and action.get("query"):
-                            label = f'Searched: {action["query"]}'
-                        elif action_type == "open_page" and action.get("url"):
-                            label = f'Opened page: {action["url"]}'
-                        elif action_type == "find_in_page" and action.get("pattern"):
-                            label = f'Found in page: {action["pattern"]}'
-                        else:
-                            label = None
-                        if label:
-                            encoded = activity(label)
-                            if encoded:
-                                yield encoded
-                    continue
-
-                if event_type == "response.output_text.delta":
-                    delta = str(getattr(event, "delta", "") or "")
-                    if delta:
-                        assistant_text += delta
-                        yield encode_sse(
-                            {"type": "output_delta", "delta": delta}
-                        )
-                    continue
-
-                if event_type == "response.completed":
-                    final_response = getattr(event, "response", None)
-                    continue
-
-                if event_type in {
-                    "error",
-                    "response.failed",
-                    "response.incomplete",
-                }:
-                    raise RuntimeError(stream_event_error(event))
-
-            if final_response is None:
-                raise RuntimeError(
-                    "The stream ended without a completed response event"
-                )
-
-            if not assistant_text:
-                assistant_text = (
-                    getattr(final_response, "output_text", None)
-                    or "(The model returned no text.)"
-                )
-
-            downloads = generated_downloads(endpoint, final_response)
-            web_research = extract_web_research(final_response)
-            for label in web_activity_labels(web_research):
-                if label not in activities:
-                    activities.append(label)
-            duration_seconds = round(time.monotonic() - started_at, 1)
-            response_id = str(getattr(final_response, "id", ""))
-            assistant_message = db.add_message(
-                conversation_id,
-                "assistant",
-                assistant_text,
+        if attachments or project_files or retained_generated_files:
+            db.update_generation_job(job.id, status_label="Preparing files")
+            job.publish(
                 {
-                    "endpoint_id": endpoint.id,
-                    "model_id": model.id,
-                    "response_id": response_id,
-                    "generated_files": downloads,
-                    "reasoning_summary": reasoning_summary,
-                    "activities": activities,
-                    "duration_seconds": duration_seconds,
-                    "web_research": web_research,
-                    "web_search_enabled": payload.use_web_search,
-                    "research_depth": payload.research_depth,
-                },
-            )
-            db.update_conversation(
-                conversation_id,
-                endpoint_id=endpoint.id,
-                model_id=model.id,
-                previous_response_id=response_id,
-                previous_endpoint_id=endpoint.id,
-                previous_model_id=model.id,
-            )
-
-            yield encode_sse(
-                {
-                    "type": "done",
-                    "assistant_message": assistant_message,
-                    "generated_files": downloads,
-                    "response_id": response_id,
-                    "duration_seconds": duration_seconds,
-                    "web_research": web_research,
+                    "type": "status",
+                    "label": "Preparing attached and retained files",
                 }
             )
-        except GeneratorExit:
-            logger.info("Client stopped generation for %s", conversation_id)
-            raise
-        except Exception as exc:
-            if cancellation.is_set():
-                logger.info("Cancelled provider stream ended for %s", conversation_id)
-                return
-            logger.exception("Streaming provider request failed")
-            error_message = db.add_message(
-                conversation_id,
-                "assistant",
-                f"Request failed: {exc}",
-                {"error": True},
-            )
-            yield encode_sse(
-                {
-                    "type": "error",
-                    "message": str(exc),
-                    "assistant_message": error_message,
-                }
-            )
-        finally:
-            with _cancellation_lock:
-                if _active_cancellations.get(conversation_id) is cancellation:
-                    _active_cancellations.pop(conversation_id, None)
 
-            if provider_stream is not None:
-                close = getattr(provider_stream, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:
-                        logger.debug("Could not close provider stream", exc_info=True)
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
-    )
-
-
-@app.post("/api/conversations/{conversation_id}/messages")
-def send_message(
-    conversation_id: str, payload: MessageCreate
-) -> dict[str, Any]:
-    try:
-        conversation = db.get_conversation(conversation_id)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-
-    endpoint, model = normalize_message_provider(payload)
-    validate_message_options(payload, model)
-    attachments, project_files = conversation_context(conversation, payload)
-
-    user_message = db.add_message(
-        conversation_id,
-        "user",
-        payload.content.strip(),
-        {
-            "attachment_ids": payload.attachment_ids,
-            "project_file_ids": [item["id"] for item in project_files],
-            "endpoint_id": config.default_endpoint,
-            "model_id": payload.model_id or config.default_model,
-            "use_web_search": payload.use_web_search,
-            "research_depth": payload.research_depth,
-        },
-    )
-
-    if conversation["title"] == "New chat":
-        new_title = payload.content.strip().replace("\n", " ")[:70]
-        db.update_conversation(conversation_id, title=new_title or "New chat")
-
-    try:
         provider_file_ids, named_provider_files = prepare_provider_files(
-            endpoint, attachments, project_files
+            endpoint,
+            attachments,
+            project_files,
+            retained_generated_files,
         )
         input_payload, previous_response_id = build_input_payload(
             conversation=conversation,
             payload=payload,
             named_provider_files=named_provider_files,
         )
-        response = create_response(
+
+        if job.cancel_event.is_set():
+            _finish_cancelled_generation(
+                job=job,
+                endpoint=endpoint,
+                model=model,
+                payload=payload,
+                assistant_text=assistant_text,
+                reasoning_summary=reasoning_summary,
+                activities=activities,
+                started_monotonic=started_monotonic,
+            )
+            return
+
+        db.update_generation_job(job.id, status_label="Thinking")
+        job.publish({"type": "status", "label": "Thinking"})
+
+        provider_stream = stream_response(
             endpoint=endpoint,
             model=model,
             input_payload=input_payload,
@@ -1173,51 +1192,449 @@ def send_message(
             web_blocked_domains=payload.web_blocked_domains,
             previous_response_id=previous_response_id,
         )
+        job.set_cancel_callback(getattr(provider_stream, "close", None))
 
-        downloads = generated_downloads(endpoint, response)
-        web_research = extract_web_research(response)
-        assistant_text = response.output_text or "(The model returned no text.)"
-        assistant_message = db.add_message(
-            conversation_id,
-            "assistant",
-            assistant_text,
-            {
-                "endpoint_id": endpoint.id,
-                "model_id": model.id,
-                "response_id": response.id,
-                "generated_files": downloads,
-                "web_research": web_research,
-                "web_search_enabled": payload.use_web_search,
-                "research_depth": payload.research_depth,
-                "activities": web_activity_labels(web_research),
-            },
+        for event in provider_stream:
+            if job.cancel_event.is_set():
+                break
+
+            event_type = str(getattr(event, "type", ""))
+
+            if event_type in {
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary.delta",
+            }:
+                delta = str(getattr(event, "delta", "") or "")
+                if delta:
+                    reasoning_summary += delta
+                    job.publish({"type": "reasoning_delta", "delta": delta})
+                continue
+
+            if event_type in {
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary.done",
+            }:
+                complete_text = str(getattr(event, "text", "") or "")
+                if complete_text:
+                    reasoning_summary = complete_text
+                    job.publish(
+                        {"type": "reasoning_done", "text": complete_text}
+                    )
+                continue
+
+            if event_type == "response.code_interpreter_call.in_progress":
+                activity("Starting Code Interpreter")
+                continue
+            if event_type == "response.code_interpreter_call_code.delta":
+                activity("Writing Python")
+                continue
+            if event_type == "response.code_interpreter_call.interpreting":
+                activity("Running Python")
+                continue
+            if event_type == "response.code_interpreter_call.completed":
+                activity("Code Interpreter finished")
+                continue
+            if event_type == "response.web_search_call.in_progress":
+                activity("Starting web search")
+                continue
+            if event_type == "response.web_search_call.searching":
+                activity("Searching the web")
+                continue
+            if event_type == "response.web_search_call.completed":
+                activity("Web search finished")
+                continue
+
+            if event_type == "response.output_item.done":
+                item = getattr(event, "item", None)
+                try:
+                    item_raw = item.model_dump() if item is not None else {}
+                except Exception:
+                    item_raw = {}
+                if item_raw.get("type") == "web_search_call":
+                    action = item_raw.get("action") or {}
+                    action_type = action.get("type")
+                    if action_type == "search" and action.get("query"):
+                        activity(f'Searched: {action["query"]}')
+                    elif action_type == "open_page" and action.get("url"):
+                        activity(f'Opened page: {action["url"]}')
+                    elif action_type == "find_in_page" and action.get("pattern"):
+                        activity(f'Found in page: {action["pattern"]}')
+                continue
+
+            if event_type == "response.output_text.delta":
+                delta = str(getattr(event, "delta", "") or "")
+                if delta:
+                    assistant_text += delta
+                    job.publish({"type": "output_delta", "delta": delta})
+                continue
+
+            if event_type == "response.completed":
+                final_response = getattr(event, "response", None)
+                continue
+
+            if event_type in {
+                "error",
+                "response.failed",
+                "response.incomplete",
+            }:
+                raise RuntimeError(stream_event_error(event))
+
+        if job.cancel_event.is_set():
+            _finish_cancelled_generation(
+                job=job,
+                endpoint=endpoint,
+                model=model,
+                payload=payload,
+                assistant_text=assistant_text,
+                reasoning_summary=reasoning_summary,
+                activities=activities,
+                started_monotonic=started_monotonic,
+            )
+            return
+
+        if final_response is None:
+            raise RuntimeError(
+                "The stream ended without a completed response event"
+            )
+
+        if not assistant_text:
+            assistant_text = (
+                getattr(final_response, "output_text", None)
+                or "(The model returned no text.)"
+            )
+
+        retained_records, downloads = persist_generated_files(
+            endpoint, final_response, job.conversation_id
         )
+        web_research = extract_web_research(final_response)
+        for label in web_activity_labels(web_research):
+            if label not in activities:
+                activities.append(label)
+        duration_seconds = round(time.monotonic() - started_monotonic, 1)
+        response_id = str(getattr(final_response, "id", ""))
+
+        try:
+            assistant_message = db.add_message(
+                job.conversation_id,
+                "assistant",
+                assistant_text,
+                {
+                    "endpoint_id": endpoint.id,
+                    "model_id": model.id,
+                    "response_id": response_id,
+                    "generated_files": downloads,
+                    "reasoning_summary": reasoning_summary,
+                    "activities": activities,
+                    "duration_seconds": duration_seconds,
+                    "web_research": web_research,
+                    "web_search_enabled": payload.use_web_search,
+                    "research_depth": payload.research_depth,
+                },
+                generated_files=retained_records,
+            )
+        except Exception:
+            remove_generated_file_bytes(retained_records)
+            raise
+
         db.update_conversation(
-            conversation_id,
+            job.conversation_id,
             endpoint_id=endpoint.id,
             model_id=model.id,
-            previous_response_id=response.id,
+            previous_response_id=response_id,
             previous_endpoint_id=endpoint.id,
             previous_model_id=model.id,
         )
-
-        return {
-            "user_message": user_message,
-            "assistant_message": assistant_message,
-            "generated_files": downloads,
-            "response_id": response.id,
-        }
-    except HTTPException:
-        raise
+        completed_at = time.time()
+        db.update_generation_job(
+            job.id,
+            assistant_message_id=assistant_message["id"],
+            status="completed",
+            status_label="Completed",
+            completed_at=completed_at,
+        )
+        job.publish(
+            {
+                "type": "done",
+                "assistant_message": assistant_message,
+                "generated_files": downloads,
+                "response_id": response_id,
+                "duration_seconds": duration_seconds,
+                "web_research": web_research,
+                "completed_at": completed_at,
+            }
+        )
     except Exception as exc:
-        logger.exception("Provider request failed")
-        db.add_message(
-            conversation_id,
+        if job.cancel_event.is_set():
+            try:
+                _finish_cancelled_generation(
+                    job=job,
+                    endpoint=endpoint,
+                    model=model,
+                    payload=payload,
+                    assistant_text=assistant_text,
+                    reasoning_summary=reasoning_summary,
+                    activities=activities,
+                    started_monotonic=started_monotonic,
+                )
+            except Exception:
+                logger.exception("Could not finalize cancelled generation")
+            return
+
+        logger.exception("Background provider request failed")
+        error_message = db.add_message(
+            job.conversation_id,
             "assistant",
             f"Request failed: {exc}",
             {"error": True},
         )
-        raise HTTPException(status_code=502, detail=str(exc))
+        db.clear_response_link(job.conversation_id)
+        completed_at = time.time()
+        db.update_generation_job(
+            job.id,
+            assistant_message_id=error_message["id"],
+            status="failed",
+            status_label="Failed",
+            error=str(exc),
+            completed_at=completed_at,
+        )
+        job.publish(
+            {
+                "type": "error",
+                "message": str(exc),
+                "assistant_message": error_message,
+                "completed_at": completed_at,
+            }
+        )
+    finally:
+        job.set_cancel_callback(None)
+        if provider_stream is not None:
+            close = getattr(provider_stream, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("Could not close provider stream", exc_info=True)
+
+        with _generation_lock:
+            if _active_generation_by_conversation.get(job.conversation_id) == job.id:
+                _active_generation_by_conversation.pop(job.conversation_id, None)
+
+
+def _prune_generation_registry() -> None:
+    cutoff = time.time() - 600
+    with _generation_lock:
+        expired = [
+            job_id
+            for job_id, job in _generations.items()
+            if job.status in TERMINAL_GENERATION_STATUSES
+            and job.completed_at is not None
+            and float(job.completed_at) < cutoff
+        ]
+        for job_id in expired:
+            _generations.pop(job_id, None)
+
+
+def _start_generation_job(
+    conversation_id: str, payload: MessageCreate
+) -> tuple[GenerationJob, dict[str, Any]]:
+    try:
+        conversation = db.get_conversation(conversation_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    endpoint, model = normalize_message_provider(payload)
+    validate_message_options(payload, model)
+    attachments, project_files, retained_generated_files = conversation_context(
+        conversation, payload
+    )
+
+    with _generation_lock:
+        ensure_conversation_idle(conversation_id)
+        user_message = db.add_message(
+            conversation_id,
+            "user",
+            payload.content.strip(),
+            {
+                "attachment_ids": payload.attachment_ids,
+                "project_file_ids": [item["id"] for item in project_files],
+                "endpoint_id": endpoint.id,
+                "model_id": model.id,
+                "use_web_search": payload.use_web_search,
+                "research_depth": payload.research_depth,
+            },
+        )
+
+        if conversation["title"] == "New chat":
+            new_title = payload.content.strip().replace("\n", " ")[:70]
+            db.update_conversation(
+                conversation_id, title=new_title or "New chat"
+            )
+
+        job_row = db.create_generation_job(conversation_id, user_message["id"])
+        job = GenerationJob(job_row, user_message)
+        _generations[job.id] = job
+        _active_generation_by_conversation[conversation_id] = job.id
+
+    _prune_generation_registry()
+    worker = threading.Thread(
+        target=_run_generation_job,
+        kwargs={
+            "job": job,
+            "conversation": conversation,
+            "payload": payload,
+            "endpoint": endpoint,
+            "model": model,
+            "attachments": attachments,
+            "project_files": project_files,
+            "retained_generated_files": retained_generated_files,
+        },
+        name=f"generation-{job.id[:8]}",
+        daemon=True,
+    )
+    worker.start()
+    return job, user_message
+
+
+@app.post(
+    "/api/conversations/{conversation_id}/messages/start",
+    status_code=202,
+)
+def start_message_generation(
+    conversation_id: str, payload: MessageCreate
+) -> dict[str, Any]:
+    job, user_message = _start_generation_job(conversation_id, payload)
+    return {
+        "generation": job.snapshot(),
+        "user_message": user_message,
+    }
+
+
+@app.get("/api/generations/{generation_id}")
+def get_generation(generation_id: str) -> dict[str, Any]:
+    with _generation_lock:
+        job = _generations.get(generation_id)
+    if job is not None:
+        return job.snapshot()
+
+    try:
+        row = db.get_generation_job(generation_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Generation not found")
+    return {
+        **row,
+        "last_sequence": 0,
+        "assistant_text": "",
+        "reasoning_summary": "",
+        "activities": [],
+    }
+
+
+@app.get("/api/generations/{generation_id}/stream")
+def stream_generation(
+    generation_id: str,
+    after: int = Query(default=0, ge=0),
+) -> StreamingResponse:
+    with _generation_lock:
+        job = _generations.get(generation_id)
+    if job is None:
+        raise HTTPException(
+            status_code=410,
+            detail="This generation stream is no longer available",
+        )
+
+    return StreamingResponse(
+        job.event_stream(after),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.post("/api/conversations/{conversation_id}/cancel")
+def cancel_generation(conversation_id: str) -> dict[str, bool]:
+    try:
+        db.get_conversation(conversation_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    with _generation_lock:
+        job_id = _active_generation_by_conversation.get(conversation_id)
+        job = _generations.get(job_id) if job_id else None
+    if job is not None and job.status in ACTIVE_GENERATION_STATUSES:
+        job.request_cancel()
+        return {"cancelled": True}
+    return {"cancelled": False}
+
+
+@app.post("/api/conversations/{conversation_id}/messages/stream")
+def stream_message(
+    conversation_id: str, payload: MessageCreate
+) -> StreamingResponse:
+    job, _ = _start_generation_job(conversation_id, payload)
+    return StreamingResponse(
+        job.event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.post("/api/conversations/{conversation_id}/messages")
+def send_message(
+    conversation_id: str, payload: MessageCreate
+) -> dict[str, Any]:
+    job, user_message = _start_generation_job(conversation_id, payload)
+    job.wait()
+    snapshot = job.snapshot()
+    if snapshot["status"] == "completed" and snapshot["assistant_message_id"]:
+        assistant_message = db.get_message(snapshot["assistant_message_id"])
+        return {
+            "user_message": user_message,
+            "assistant_message": assistant_message,
+            "generated_files": assistant_message.get("metadata", {}).get(
+                "generated_files", []
+            ),
+            "response_id": assistant_message.get("metadata", {}).get(
+                "response_id"
+            ),
+        }
+    if snapshot["status"] == "cancelled":
+        raise HTTPException(status_code=409, detail="Generation was stopped")
+    raise HTTPException(
+        status_code=502,
+        detail=snapshot.get("error") or "The generation failed",
+    )
+
+
+@app.get(
+    "/api/conversations/{conversation_id}/generated-files/{file_id}/download",
+    response_class=FileResponse,
+)
+def retained_generated_file(
+    conversation_id: str,
+    file_id: str,
+) -> FileResponse:
+    try:
+        file_row = db.get_generated_file(file_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Generated file not found")
+    if file_row["conversation_id"] != conversation_id:
+        raise HTTPException(status_code=404, detail="Generated file not found")
+
+    path = GENERATED_DIR / file_row["stored_name"]
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Retained file is missing")
+    return FileResponse(
+        path,
+        filename=file_row["original_name"],
+        media_type=file_row.get("content_type") or "application/octet-stream",
+    )
 
 
 @app.get(

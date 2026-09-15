@@ -96,6 +96,34 @@ button {
   background: #292929;
 }
 
+.conversation-status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  border-radius: 50%;
+}
+
+.conversation-status-dot.generation-running {
+  background: #56c596;
+  box-shadow: 0 0 0 0 rgba(86, 197, 150, 0.55);
+  animation: generation-pulse 1.6s ease-out infinite;
+}
+
+.conversation-status-dot.generation-unread {
+  background: #5ca9ff;
+  box-shadow: 0 0 8px rgba(92, 169, 255, 0.5);
+}
+
+@keyframes generation-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(86, 197, 150, 0.55);
+  }
+  70%,
+  100% {
+    box-shadow: 0 0 0 6px rgba(86, 197, 150, 0);
+  }
+}
+
 .conversation-title {
   min-width: 0;
   flex: 1;

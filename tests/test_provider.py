@@ -1,4 +1,8 @@
+import io
+import zipfile
 from types import SimpleNamespace
+
+import pytest
 
 from app.provider import (
     build_history_input,
@@ -7,6 +11,7 @@ from app.provider import (
     extract_web_research,
     normalize_domains,
     supports_context_stuffing,
+    upload_file,
 )
 
 
@@ -59,8 +64,63 @@ def test_zip_is_not_context_stuffed() -> None:
     assert supports_context_stuffing("repository.zip") is False
 
 
+def test_notebook_is_not_context_stuffed() -> None:
+    assert supports_context_stuffing("analysis.ipynb") is False
+
+
 def test_readme_can_be_context_stuffed() -> None:
     assert supports_context_stuffing("README.md") is True
+
+
+def test_upload_file_wraps_unsupported_extension_in_zip(
+    tmp_path, monkeypatch
+) -> None:
+    notebook = tmp_path / "analysis.ipynb"
+    notebook.write_text('{"cells": []}', encoding="utf-8")
+    uploads: list[tuple[str, bytes]] = []
+
+    class InvalidExtensionError(Exception):
+        status_code = 400
+
+    def create(*, file, purpose):
+        filename, handle = file
+        assert purpose == "assistants"
+        content = handle.read()
+        uploads.append((filename, content))
+        if len(uploads) == 1:
+            raise InvalidExtensionError("Invalid extension ipynb")
+        return SimpleNamespace(id="file-zipped")
+
+    client = SimpleNamespace(files=SimpleNamespace(create=create))
+    monkeypatch.setattr("app.provider.make_client", lambda _endpoint: client)
+
+    result = upload_file(SimpleNamespace(), notebook, "analysis.ipynb")
+
+    assert result == "file-zipped"
+    assert uploads[0] == ("analysis.ipynb", b'{"cells": []}')
+    assert uploads[1][0] == "analysis.ipynb.zip"
+    with zipfile.ZipFile(io.BytesIO(uploads[1][1])) as archive:
+        assert archive.namelist() == ["analysis.ipynb"]
+        assert archive.read("analysis.ipynb") == b'{"cells": []}'
+
+
+def test_upload_file_does_not_hide_other_upload_errors(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "report.csv"
+    source.write_text("value\n42\n", encoding="utf-8")
+
+    class AuthenticationError(Exception):
+        status_code = 401
+
+    def create(**_kwargs):
+        raise AuthenticationError("Invalid API key")
+
+    client = SimpleNamespace(files=SimpleNamespace(create=create))
+    monkeypatch.setattr("app.provider.make_client", lambda _endpoint: client)
+
+    with pytest.raises(AuthenticationError, match="Invalid API key"):
+        upload_file(SimpleNamespace(), source, "report.csv")
 
 
 

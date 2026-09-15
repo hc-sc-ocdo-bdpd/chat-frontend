@@ -6,10 +6,12 @@ Responses API.
 ## Features
 
 - Streaming chat with reasoning summaries and tool activity
+- Independent background responses across multiple chats
+- In-progress and unread-response indicators in the chat sidebar
 - Multiple Azure model deployments from one `.env` file
 - Reasoning-effort and response-verbosity controls
 - Azure Code Interpreter and web research
-- File uploads and generated-file downloads
+- File uploads and durable generated-file downloads
 - Projects with reusable files and instructions
 - Edit, regenerate, stop, branch, copy, and delete message workflows
 - Markdown, code blocks, links, citations, and rendered math
@@ -147,7 +149,8 @@ Most teams should not need to edit that file.
 
 ## Local data
 
-Chats, projects, uploaded files, and the SQLite database are stored under:
+Chats, projects, uploaded files, retained model-generated files, response-job
+state, and the SQLite database are stored under:
 
 ```text
 data/
@@ -155,6 +158,19 @@ data/
 
 Keep this folder when updating the app. The `.env`, `.venv`, and `data/` paths
 are ignored by Git.
+
+Generated Code Interpreter files are copied into `data/generated/` as soon as a
+response finishes. Their chat messages point to the retained local copy rather
+than the temporary Azure container, and retained files are uploaded again when
+the model needs them in a later turn. If Azure rejects a retained file's
+extension, such as `.ipynb`, the app gives Code Interpreter a ZIP containing the
+original file. The user's saved download keeps its original name and format.
+Files whose Azure containers expired before this version was installed cannot
+be recovered retroactively.
+
+Database schema updates are applied automatically at startup. A response that
+was still running during an application restart is marked as interrupted, while
+completed messages and retained files remain available.
 
 ## Privacy and security
 

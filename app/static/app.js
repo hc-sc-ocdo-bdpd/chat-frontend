@@ -7,8 +7,9 @@ const state = {
   activeProjectFilter: "all",
   editingProjectId: null,
   pendingAttachments: [],
-  busy: false,
-  abortController: null,
+  generations: new Map(),
+  generationConnections: new Map(),
+  pendingGenerationConversations: new Set(),
 };
 
 const el = {
@@ -79,11 +80,9 @@ async function api(path, options = {}) {
   return response.json();
 }
 
-async function streamApi(path, payload, onEvent, signal) {
+async function streamEvents(path, onEvent, signal) {
   const response = await fetch(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    headers: { Accept: "text/event-stream" },
     signal,
   });
 
@@ -148,6 +147,88 @@ function currentModel() {
 
 function projectById(projectId) {
   return state.projects.find((project) => project.id === projectId) || null;
+}
+
+const ACTIVE_GENERATION_STATUSES = new Set(["queued", "running", "cancelling"]);
+
+function registerGeneration(snapshot) {
+  const existing = state.generations.get(snapshot.id);
+  const generation = existing || { id: snapshot.id };
+  const snapshotAnswer = snapshot.assistant_text;
+  const existingAnswer = generation.assistantText || "";
+  const snapshotReasoning = snapshot.reasoning_summary;
+  const existingReasoning = generation.reasoningText || "";
+  const previousActivities = Array.from(generation.activities || []);
+  const previousSequence = Number(generation.lastSequence || 0);
+  const previousView = generation.view || null;
+  const wasFinalized = generation.finalized || false;
+
+  Object.assign(generation, snapshot);
+  generation.conversationId =
+    snapshot.conversation_id || generation.conversationId;
+  generation.assistantText =
+    snapshotAnswer === undefined ||
+    String(snapshotAnswer).length < existingAnswer.length
+      ? existingAnswer
+      : String(snapshotAnswer);
+  generation.reasoningText =
+    snapshotReasoning === undefined ||
+    String(snapshotReasoning).length < existingReasoning.length
+      ? existingReasoning
+      : String(snapshotReasoning);
+  generation.activities = new Set([
+    ...previousActivities,
+    ...(snapshot.activities || []),
+  ]);
+  generation.lastSequence = Math.max(
+    Number(snapshot.last_sequence || 0),
+    previousSequence
+  );
+  generation.view = previousView;
+  generation.finalized = wasFinalized;
+  state.generations.set(generation.id, generation);
+  return generation;
+}
+
+function generationForConversation(conversationId) {
+  for (const generation of state.generations.values()) {
+    if (
+      generation.conversationId === conversationId &&
+      ACTIVE_GENERATION_STATUSES.has(generation.status)
+    ) {
+      return generation;
+    }
+  }
+
+  const conversation = state.conversations.find(
+    (item) => item.id === conversationId
+  );
+  if (
+    conversation?.generation_id &&
+    ACTIVE_GENERATION_STATUSES.has(conversation.generation_status)
+  ) {
+    return {
+      id: conversation.generation_id,
+      conversationId,
+      status: conversation.generation_status,
+      status_label: conversation.generation_status_label || "Thinking",
+    };
+  }
+  return null;
+}
+
+function isConversationBusy(conversationId) {
+  return (
+    state.pendingGenerationConversations.has(conversationId) ||
+    Boolean(generationForConversation(conversationId))
+  );
+}
+
+function isActiveConversationBusy() {
+  return Boolean(
+    state.activeConversationId &&
+      isConversationBusy(state.activeConversationId)
+  );
 }
 
 function fillSelect(select, values, selectedValue, mapLabel = (value) => value) {
@@ -316,6 +397,26 @@ function renderConversations() {
       row.classList.add("active");
     }
 
+    const generation = generationForConversation(conversation.id);
+    const generationPending = state.pendingGenerationConversations.has(
+      conversation.id
+    );
+    let statusDot = null;
+    if (generation || generationPending) {
+      statusDot = document.createElement("span");
+      statusDot.className = "conversation-status-dot generation-running";
+      statusDot.title = generation?.status_label || "Starting response";
+      statusDot.setAttribute("aria-label", "Response in progress");
+    } else if (
+      conversation.unread &&
+      conversation.id !== state.activeConversationId
+    ) {
+      statusDot = document.createElement("span");
+      statusDot.className = "conversation-status-dot generation-unread";
+      statusDot.title = "New response";
+      statusDot.setAttribute("aria-label", "New response");
+    }
+
     const titleWrap = document.createElement("div");
     titleWrap.className = "conversation-title-wrap";
 
@@ -362,6 +463,10 @@ function renderConversations() {
     remove.className = "mini-button";
     remove.title = "Delete";
     remove.textContent = "×";
+    remove.disabled = Boolean(generation || generationPending);
+    if (generation || generationPending) {
+      remove.title = "Stop the response before deleting this chat";
+    }
     remove.addEventListener("click", async (event) => {
       event.stopPropagation();
       if (!confirm(`Delete "${conversation.title}"?`)) return;
@@ -381,6 +486,7 @@ function renderConversations() {
     });
 
     actions.append(move, rename, remove);
+    if (statusDot) row.appendChild(statusDot);
     row.append(titleWrap, actions);
     row.addEventListener("click", () => openConversation(conversation.id));
     el.conversationList.appendChild(row);
@@ -979,6 +1085,67 @@ function finishStreamingAssistant(streaming) {
   streaming.row.remove();
 }
 
+function detachGenerationViews() {
+  state.generations.forEach((generation) => {
+    if (!generation.view) return;
+    clearInterval(generation.view.timer);
+    generation.view = null;
+  });
+}
+
+function attachGenerationView(generation) {
+  if (
+    !generation ||
+    generation.conversationId !== state.activeConversationId ||
+    !ACTIVE_GENERATION_STATUSES.has(generation.status)
+  ) {
+    return;
+  }
+
+  if (generation.view && document.body.contains(generation.view.row)) {
+    return;
+  }
+
+  const streaming = addStreamingAssistant();
+  const startedAt = Number(generation.started_at || generation.created_at);
+  if (Number.isFinite(startedAt)) {
+    const elapsedMs = Math.max(0, Date.now() - startedAt * 1000);
+    streaming.startedAt = performance.now() - elapsedMs;
+  }
+
+  streaming.answerText = generation.assistantText || "";
+  streaming.reasoningText = generation.reasoningText || "";
+  streaming.activities = new Set();
+  setStreamingReasoning(streaming, streaming.reasoningText);
+  Array.from(generation.activities || []).forEach((label) =>
+    addStreamingActivity(streaming, label)
+  );
+  updateStreamingStatus(
+    streaming,
+    generation.status_label || generation.statusLabel || "Thinking"
+  );
+  if (streaming.answerText) scheduleStreamingAnswerRender(streaming);
+  generation.view = streaming;
+}
+
+function updateGenerationView(generation) {
+  if (generation.conversationId !== state.activeConversationId) return;
+  attachGenerationView(generation);
+  const streaming = generation.view;
+  if (!streaming) return;
+
+  streaming.answerText = generation.assistantText || "";
+  setStreamingReasoning(streaming, generation.reasoningText || "");
+  Array.from(generation.activities || []).forEach((label) =>
+    addStreamingActivity(streaming, label)
+  );
+  updateStreamingStatus(
+    streaming,
+    generation.status_label || generation.statusLabel || "Thinking"
+  );
+  scheduleStreamingAnswerRender(streaming);
+}
+
 
 function safeHostname(url) {
   try {
@@ -1196,6 +1363,7 @@ function messageElement(message, temporary = false) {
 }
 
 function renderMessages(messages) {
+  detachGenerationViews();
   clearMathTypeset(el.messages);
   el.messages.innerHTML = "";
   if (!messages.length) {
@@ -1268,6 +1436,184 @@ function renderProjectContext() {
   el.activeProjectBadge.onclick = () => openProjectModal(project.id);
 }
 
+function applyGenerationEvent(generation, event) {
+  generation.lastSequence = Math.max(
+    generation.lastSequence || 0,
+    Number(event.sequence || 0)
+  );
+
+  switch (event.type) {
+    case "started":
+      generation.status = "running";
+      generation.started_at = event.started_at || generation.started_at;
+      generation.status_label = event.label || "Thinking";
+      if (
+        event.user_message &&
+        generation.conversationId === state.activeConversationId &&
+        !el.messages.querySelector(
+          `[data-message-id="${event.user_message.id}"]`
+        )
+      ) {
+        if (el.messages.querySelector(".welcome")) el.messages.innerHTML = "";
+        el.messages.appendChild(messageElement(event.user_message));
+      }
+      break;
+
+    case "status":
+      generation.status_label = event.label || "Thinking";
+      break;
+
+    case "reasoning_delta":
+      generation.reasoningText += event.delta || "";
+      break;
+
+    case "reasoning_done":
+      generation.reasoningText = event.text || "";
+      break;
+
+    case "activity":
+      if (event.label) generation.activities.add(event.label);
+      generation.status_label = event.label || generation.status_label;
+      break;
+
+    case "output_delta":
+      generation.assistantText += event.delta || "";
+      generation.status_label = "Writing response";
+      break;
+
+    case "done":
+      generation.status = "completed";
+      generation.status_label = "Completed";
+      generation.completed_at = event.completed_at;
+      generation.assistant_message_id = event.assistant_message?.id || null;
+      break;
+
+    case "cancelled":
+      generation.status = "cancelled";
+      generation.status_label = "Stopped";
+      generation.completed_at = event.completed_at;
+      generation.assistant_message_id = event.assistant_message?.id || null;
+      break;
+
+    case "error":
+      generation.status = "failed";
+      generation.status_label = "Failed";
+      generation.completed_at = event.completed_at;
+      generation.error = event.message || "The request failed";
+      generation.assistant_message_id = event.assistant_message?.id || null;
+      break;
+
+    default:
+      break;
+  }
+
+  updateGenerationView(generation);
+  if (["started", "done", "cancelled", "error"].includes(event.type)) {
+    renderConversations();
+  }
+  updateComposerState();
+}
+
+async function finalizeGeneration(generation) {
+  if (generation.finalized) return;
+  generation.finalized = true;
+  state.pendingGenerationConversations.delete(generation.conversationId);
+
+  if (generation.view) {
+    finishStreamingAssistant(generation.view);
+    generation.view = null;
+  }
+
+  const wasActive = generation.conversationId === state.activeConversationId;
+  await loadWorkspace();
+
+  if (wasActive && state.activeConversationId === generation.conversationId) {
+    await openConversation(generation.conversationId, {
+      clearPending: false,
+      markRead: true,
+    });
+  } else if (generation.status === "completed") {
+    const conversation = state.conversations.find(
+      (item) => item.id === generation.conversationId
+    );
+    showToast(`Response ready in "${conversation?.title || "another chat"}"`);
+  } else if (generation.status === "failed") {
+    showToast(generation.error || "A background response failed");
+  }
+
+  updateComposerState();
+}
+
+async function followGeneration(generation) {
+  const controller = new AbortController();
+  const connection = { controller, promise: null };
+  state.generationConnections.set(generation.id, connection);
+
+  connection.promise = (async () => {
+    while (ACTIVE_GENERATION_STATUSES.has(generation.status)) {
+      try {
+        await streamEvents(
+          `/api/generations/${generation.id}/stream?after=${generation.lastSequence || 0}`,
+          async (event) => {
+            applyGenerationEvent(generation, event);
+            if (!ACTIVE_GENERATION_STATUSES.has(generation.status)) {
+              await finalizeGeneration(generation);
+            }
+          },
+          controller.signal
+        );
+      } catch (error) {
+        if (error.name === "AbortError") return;
+        try {
+          const snapshot = await api(`/api/generations/${generation.id}`);
+          registerGeneration(snapshot);
+          generation = state.generations.get(generation.id);
+          updateGenerationView(generation);
+          if (!ACTIVE_GENERATION_STATUSES.has(generation.status)) {
+            await finalizeGeneration(generation);
+            return;
+          }
+        } catch (_) {
+          await new Promise((resolve) => setTimeout(resolve, 800));
+          continue;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+
+      if (!ACTIVE_GENERATION_STATUSES.has(generation.status)) return;
+    }
+  })().finally(() => {
+    if (state.generationConnections.get(generation.id) === connection) {
+      state.generationConnections.delete(generation.id);
+    }
+  });
+}
+
+async function ensureGenerationConnection(generationId, conversationId) {
+  let generation = state.generations.get(generationId);
+  if (!generation) {
+    try {
+      const snapshot = await api(`/api/generations/${generationId}`);
+      generation = registerGeneration({
+        ...snapshot,
+        conversation_id: snapshot.conversation_id || conversationId,
+      });
+    } catch (error) {
+      console.warn("Could not restore generation status", error);
+      return;
+    }
+  }
+
+  updateGenerationView(generation);
+  if (!ACTIVE_GENERATION_STATUSES.has(generation.status)) {
+    await finalizeGeneration(generation);
+    return;
+  }
+  if (!state.generationConnections.has(generation.id)) {
+    followGeneration(generation);
+  }
+}
+
 async function loadProjects() {
   state.projects = await api("/api/projects");
   renderProjects();
@@ -1277,6 +1623,21 @@ async function loadProjects() {
 async function loadConversations() {
   state.conversations = await api("/api/conversations");
   renderConversations();
+  await Promise.all(
+    state.conversations
+      .filter(
+        (conversation) =>
+          conversation.generation_id &&
+          ACTIVE_GENERATION_STATUSES.has(conversation.generation_status)
+      )
+      .map((conversation) =>
+        ensureGenerationConnection(
+          conversation.generation_id,
+          conversation.id
+        )
+      )
+  );
+  updateComposerState();
 }
 
 async function loadWorkspace() {
@@ -1332,23 +1693,46 @@ async function createConversation() {
   el.messageInput.focus();
 }
 
-async function openConversation(id) {
+async function openConversation(
+  id,
+  { clearPending = true, markRead = true } = {}
+) {
   state.activeConversationId = id;
-  state.activeConversation = await api(`/api/conversations/${id}`);
+  const conversation = await api(`/api/conversations/${id}`);
+  if (state.activeConversationId !== id) return;
+  state.activeConversation = conversation;
+
+  if (markRead) {
+    await api(`/api/conversations/${id}/read`, { method: "POST" });
+    if (state.activeConversationId !== id) return;
+    const summary = state.conversations.find((item) => item.id === id);
+    if (summary) summary.unread = false;
+  }
 
   refreshModelSelect(state.activeConversation.model_id);
   renderMessages(state.activeConversation.messages);
 
-  state.pendingAttachments = [];
-  renderPendingFiles();
+  if (state.activeConversation.generation) {
+    const generation = registerGeneration(
+      state.activeConversation.generation
+    );
+    attachGenerationView(generation);
+    ensureGenerationConnection(generation.id, id);
+  }
+
+  if (clearPending) {
+    state.pendingAttachments = [];
+    renderPendingFiles();
+  }
   renderConversations();
   renderProjectContext();
+  updateComposerState();
   el.sidebar.classList.remove("open");
 }
 
 async function refreshActiveConversation() {
   if (!state.activeConversationId) return;
-  await openConversation(state.activeConversationId);
+  await openConversation(state.activeConversationId, { clearPending: false });
 }
 
 async function ensureConversation() {
@@ -1383,29 +1767,30 @@ function autosizeTextarea() {
     `${Math.min(el.messageInput.scrollHeight, 180)}px`;
 }
 
-function setBusy(busy) {
-  state.busy = busy;
+function updateComposerState() {
+  const busy = isActiveConversationBusy();
   el.sendButton.classList.toggle("stop-mode", busy);
   el.sendButton.textContent = busy ? "■" : "↑";
   el.sendButton.title = busy ? "Stop generation" : "Send";
 }
 
 async function stopGeneration() {
-  if (!state.busy || !state.abortController || !state.activeConversationId) {
-    return;
-  }
-
-  const controller = state.abortController;
+  if (!state.activeConversationId || !isActiveConversationBusy()) return;
+  const generation = generationForConversation(state.activeConversationId);
   try {
     await api(
       `/api/conversations/${state.activeConversationId}/cancel`,
       { method: "POST" }
     );
+    if (generation) {
+      generation.status = "cancelling";
+      generation.status_label = "Stopping";
+      updateGenerationView(generation);
+    }
   } catch (error) {
     console.warn("Could not signal backend cancellation", error);
-  } finally {
-    controller.abort();
   }
+  updateComposerState();
 }
 
 function messageRequestPayload(content, attachmentIds) {
@@ -1430,11 +1815,15 @@ async function sendMessageWithContent(
   { clearComposer = false } = {}
 ) {
   const cleaned = content.trim();
-  if (!cleaned || state.busy) return;
+  if (!cleaned) return;
 
   const conversationId = await ensureConversation();
-  setBusy(true);
-  state.abortController = new AbortController();
+  if (isConversationBusy(conversationId)) return;
+
+  const pendingBeforeSend = [...state.pendingAttachments];
+  state.pendingGenerationConversations.add(conversationId);
+  updateComposerState();
+  renderConversations();
 
   const optimistic = {
     role: "user",
@@ -1454,113 +1843,61 @@ async function sendMessageWithContent(
     autosizeTextarea();
   }
 
-  let completed = false;
-  let serverFailed = false;
-  let serverFailureText = "";
-
   try {
-    await streamApi(
-      `/api/conversations/${conversationId}/messages/stream`,
-      messageRequestPayload(cleaned, attachmentIds),
-      async (event) => {
-        switch (event.type) {
-          case "started":
-            optimisticElement.replaceWith(messageElement(event.user_message));
-            break;
-
-          case "status":
-            updateStreamingStatus(streaming, event.label);
-            break;
-
-          case "reasoning_delta":
-            appendStreamingReasoning(streaming, event.delta || "");
-            break;
-
-          case "reasoning_done":
-            setStreamingReasoning(streaming, event.text || "");
-            break;
-
-          case "activity":
-            addStreamingActivity(streaming, event.label);
-            updateStreamingStatus(streaming, event.label);
-            break;
-
-          case "output_delta":
-            streaming.answerText += event.delta || "";
-            updateStreamingStatus(streaming, "Writing response");
-            scheduleStreamingAnswerRender(streaming);
-            break;
-
-          case "done":
-            completed = true;
-            finishStreamingAssistant(streaming);
-            break;
-
-          case "error":
-            serverFailed = true;
-            serverFailureText = event.message || "The streamed request failed";
-            if (document.body.contains(streaming.row)) {
-              finishStreamingAssistant(streaming);
-            }
-            break;
-
-          default:
-            break;
-        }
-      },
-      state.abortController.signal
+    const started = await api(
+      `/api/conversations/${conversationId}/messages/start`,
+      {
+        method: "POST",
+        body: JSON.stringify(messageRequestPayload(cleaned, attachmentIds)),
+      }
     );
 
-    if (serverFailed) {
-      showToast(serverFailureText);
-      await refreshActiveConversation();
-    } else if (!completed) {
-      throw new Error("The response stream ended before completion");
+    const generation = registerGeneration(started.generation);
+    generation.attachments = pendingBeforeSend.filter((attachment) =>
+      attachmentIds.includes(attachment.id)
+    );
+    optimisticElement.replaceWith(messageElement(started.user_message));
+    state.pendingGenerationConversations.delete(conversationId);
+
+    if (
+      state.activeConversationId === conversationId &&
+      document.body.contains(streaming.row)
+    ) {
+      generation.view = streaming;
+      updateGenerationView(generation);
     } else {
-      await refreshActiveConversation();
+      clearInterval(streaming.timer);
+      generation.view = null;
     }
 
     await loadWorkspace();
-  } catch (error) {
-    if (error.name === "AbortError") {
-      const duration =
-        (performance.now() - streaming.startedAt) / 1000;
-
-      try {
-        await api(
-          `/api/conversations/${conversationId}/messages/partial`,
-          {
-            method: "POST",
-            body: JSON.stringify({
-              content: streaming.answerText,
-              model_id: el.model.value,
-              reasoning_summary: streaming.reasoningText,
-              activities: Array.from(streaming.activities),
-              duration_seconds: duration,
-            }),
-          }
-        );
-      } catch (saveError) {
-        console.error("Could not save partial response", saveError);
-      }
-
-      if (document.body.contains(streaming.row)) {
-        finishStreamingAssistant(streaming);
-      }
-      showToast("Generation stopped");
-      await new Promise((resolve) => setTimeout(resolve, 150));
-      await refreshActiveConversation();
-      await loadWorkspace();
+    if (ACTIVE_GENERATION_STATUSES.has(generation.status)) {
+      await ensureGenerationConnection(generation.id, conversationId);
     } else {
-      if (document.body.contains(streaming.row)) {
-        finishStreamingAssistant(streaming);
-      }
-      showToast(error.message);
-      await refreshActiveConversation();
+      await finalizeGeneration(generation);
     }
+  } catch (error) {
+    state.pendingGenerationConversations.delete(conversationId);
+    if (document.body.contains(streaming.row)) {
+      finishStreamingAssistant(streaming);
+    } else {
+      clearInterval(streaming.timer);
+    }
+    optimisticElement.remove();
+
+    if (
+      clearComposer &&
+      state.activeConversationId === conversationId &&
+      !el.messageInput.value.trim()
+    ) {
+      el.messageInput.value = cleaned;
+      state.pendingAttachments = pendingBeforeSend;
+      renderPendingFiles();
+      autosizeTextarea();
+    }
+    showToast(error.message);
   } finally {
-    state.abortController = null;
-    setBusy(false);
+    updateComposerState();
     el.messageInput.focus();
   }
 }
@@ -1583,7 +1920,7 @@ async function copyMessage(content) {
 }
 
 function startInlineEdit(row, message) {
-  if (state.busy) return;
+  if (isActiveConversationBusy()) return;
 
   const inner = row.querySelector(".message-inner");
   if (!inner || inner.querySelector(".message-editor")) return;
@@ -1629,7 +1966,7 @@ function startInlineEdit(row, message) {
 }
 
 async function regenerateMessage(message) {
-  if (state.busy || !state.activeConversation) return;
+  if (isActiveConversationBusy() || !state.activeConversation) return;
 
   const messages = state.activeConversation.messages;
   const assistantIndex = messages.findIndex((item) => item.id === message.id);
@@ -1657,7 +1994,7 @@ async function regenerateMessage(message) {
 }
 
 async function branchFromMessage(message) {
-  if (state.busy) return;
+  if (isActiveConversationBusy()) return;
 
   const branch = await api(
     `/api/conversations/${state.activeConversationId}/branch/${message.id}`,
@@ -1676,7 +2013,7 @@ async function branchFromMessage(message) {
 }
 
 async function deleteFromMessage(message) {
-  if (state.busy) return;
+  if (isActiveConversationBusy()) return;
   if (!confirm("Delete this message and everything after it?")) return;
 
   await api(
@@ -1924,6 +2261,29 @@ async function initialize() {
   }
 }
 
+let statusRefreshInFlight = false;
+
+async function refreshConversationStatuses() {
+  if (document.hidden || !state.catalog || statusRefreshInFlight) return;
+  statusRefreshInFlight = true;
+  try {
+    await loadConversations();
+    const activeSummary = state.conversations.find(
+      (item) => item.id === state.activeConversationId
+    );
+    if (activeSummary?.unread && !isActiveConversationBusy()) {
+      await openConversation(activeSummary.id, {
+        clearPending: false,
+        markRead: true,
+      });
+    }
+  } catch (error) {
+    console.debug("Conversation status refresh skipped", error);
+  } finally {
+    statusRefreshInFlight = false;
+  }
+}
+
 el.newChat.addEventListener("click", createConversation);
 el.addProject.addEventListener("click", createProject);
 el.allChatsFilter.addEventListener("click", () => selectProjectFilter("all"));
@@ -1954,7 +2314,7 @@ el.fileInput.addEventListener("change", async () => {
 });
 
 el.sendButton.addEventListener("click", () => {
-  if (state.busy) {
+  if (isActiveConversationBusy()) {
     stopGeneration();
   } else {
     sendMessage();
@@ -1965,7 +2325,7 @@ el.messageInput.addEventListener("input", autosizeTextarea);
 el.messageInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
-    if (!state.busy) sendMessage();
+    if (!isActiveConversationBusy()) sendMessage();
   }
 });
 
@@ -1986,4 +2346,10 @@ el.projectModal.addEventListener("click", (event) => {
   if (event.target === el.projectModal) closeProjectModal();
 });
 
-initialize();
+initialize().then(() => {
+  setInterval(refreshConversationStatuses, 2500);
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refreshConversationStatuses();
+});

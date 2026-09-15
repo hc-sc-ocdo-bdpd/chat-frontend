@@ -52,6 +52,7 @@ class Database:
                     previous_response_id TEXT,
                     previous_endpoint_id TEXT,
                     previous_model_id TEXT,
+                    last_read_at REAL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -93,12 +94,59 @@ class Database:
                     FOREIGN KEY(project_id) REFERENCES projects(id)
                         ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS generated_files (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    original_name TEXT NOT NULL,
+                    stored_name TEXT NOT NULL,
+                    content_type TEXT,
+                    size_bytes INTEGER NOT NULL,
+                    source_endpoint_id TEXT,
+                    source_container_id TEXT,
+                    source_file_id TEXT,
+                    provider_files_json TEXT NOT NULL DEFAULT '{}',
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY(message_id) REFERENCES messages(id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS generation_jobs (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    user_message_id TEXT,
+                    assistant_message_id TEXT,
+                    status TEXT NOT NULL,
+                    status_label TEXT NOT NULL DEFAULT 'Queued',
+                    error TEXT,
+                    created_at REAL NOT NULL,
+                    started_at REAL,
+                    updated_at REAL NOT NULL,
+                    completed_at REAL,
+                    FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY(user_message_id) REFERENCES messages(id)
+                        ON DELETE SET NULL,
+                    FOREIGN KEY(assistant_message_id) REFERENCES messages(id)
+                        ON DELETE SET NULL
+                );
                 """
             )
 
             if not self._column_exists(connection, "conversations", "project_id"):
                 connection.execute(
                     "ALTER TABLE conversations ADD COLUMN project_id TEXT"
+                )
+
+            if not self._column_exists(connection, "conversations", "last_read_at"):
+                connection.execute(
+                    "ALTER TABLE conversations ADD COLUMN last_read_at REAL"
+                )
+                connection.execute(
+                    "UPDATE conversations SET last_read_at = updated_at"
                 )
 
             connection.executescript(
@@ -111,6 +159,15 @@ class Database:
                     ON attachments(conversation_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_project_files_project
                     ON project_files(project_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_generated_files_conversation
+                    ON generated_files(conversation_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_generated_files_message
+                    ON generated_files(message_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_generation_jobs_conversation
+                    ON generation_jobs(conversation_id, created_at DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_generation_jobs_one_active
+                    ON generation_jobs(conversation_id)
+                    WHERE status IN ('queued', 'running');
                 """
             )
 
@@ -339,8 +396,8 @@ class Database:
                 """
                 INSERT INTO conversations (
                     id, title, endpoint_id, model_id, project_id,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    last_read_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     conversation_id,
@@ -348,6 +405,7 @@ class Database:
                     endpoint_id,
                     model_id,
                     project_id,
+                    now,
                     now,
                     now,
                 ),
@@ -366,13 +424,40 @@ class Database:
                     c.project_id,
                     c.created_at,
                     c.updated_at,
-                    p.name AS project_name
+                    c.last_read_at,
+                    p.name AS project_name,
+                    EXISTS (
+                        SELECT 1
+                        FROM messages unread_message
+                        WHERE unread_message.conversation_id = c.id
+                          AND unread_message.role = 'assistant'
+                          AND unread_message.created_at > COALESCE(
+                              c.last_read_at, c.created_at
+                          )
+                    ) AS unread,
+                    active_job.id AS generation_id,
+                    active_job.status AS generation_status,
+                    active_job.status_label AS generation_status_label
                 FROM conversations c
                 LEFT JOIN projects p ON p.id = c.project_id
+                LEFT JOIN generation_jobs active_job
+                  ON active_job.id = (
+                      SELECT candidate.id
+                      FROM generation_jobs candidate
+                      WHERE candidate.conversation_id = c.id
+                        AND candidate.status IN ('queued', 'running')
+                      ORDER BY candidate.created_at DESC
+                      LIMIT 1
+                  )
                 ORDER BY c.updated_at DESC
                 """
             ).fetchall()
-        return [dict(row) for row in rows]
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["unread"] = bool(item["unread"])
+            result.append(item)
+        return result
 
     def get_conversation(self, conversation_id: str) -> dict[str, Any]:
         with self._lock, self._connect() as connection:
@@ -423,6 +508,15 @@ class Database:
             previous_model_id=None,
         )
 
+    def mark_conversation_read(self, conversation_id: str) -> None:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE conversations SET last_read_at = ? WHERE id = ?",
+                (time.time(), conversation_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(conversation_id)
+
     def delete_conversation(self, conversation_id: str) -> None:
         with self._lock, self._connect() as connection:
             cursor = connection.execute(
@@ -444,8 +538,10 @@ class Database:
         metadata: dict[str, Any] | None = None,
         *,
         created_at: float | None = None,
+        message_id: str | None = None,
+        generated_files: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        message_id = str(uuid.uuid4())
+        message_id = message_id or str(uuid.uuid4())
         now = created_at if created_at is not None else time.time()
         with self._lock, self._connect() as connection:
             connection.execute(
@@ -463,6 +559,31 @@ class Database:
                     now,
                 ),
             )
+            for file_row in generated_files or []:
+                connection.execute(
+                    """
+                    INSERT INTO generated_files (
+                        id, conversation_id, message_id, original_name,
+                        stored_name, content_type, size_bytes,
+                        source_endpoint_id, source_container_id,
+                        source_file_id, provider_files_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        file_row["id"],
+                        conversation_id,
+                        message_id,
+                        file_row["original_name"],
+                        file_row["stored_name"],
+                        file_row.get("content_type"),
+                        int(file_row["size_bytes"]),
+                        file_row.get("source_endpoint_id"),
+                        file_row.get("source_container_id"),
+                        file_row.get("source_file_id"),
+                        json.dumps(file_row.get("provider_files") or {}),
+                        float(file_row.get("created_at") or now),
+                    ),
+                )
             connection.execute(
                 "UPDATE conversations SET updated_at = ? WHERE id = ?",
                 (time.time(), conversation_id),
@@ -475,6 +596,18 @@ class Database:
             "metadata": metadata or {},
             "created_at": now,
         }
+
+    def update_message_metadata(
+        self, message_id: str, metadata: dict[str, Any]
+    ) -> dict[str, Any]:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE messages SET metadata_json = ? WHERE id = ?",
+                (json.dumps(metadata), message_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(message_id)
+        return self.get_message(message_id)
 
     def get_message(self, message_id: str) -> dict[str, Any]:
         with self._lock, self._connect() as connection:
@@ -564,6 +697,184 @@ class Database:
                 (time.time(), conversation_id),
             )
         return int(cursor.rowcount)
+
+    # ------------------------------------------------------------------
+    # Generated files retained from Code Interpreter
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _decode_generated_file(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["provider_files"] = json.loads(
+            item.pop("provider_files_json") or "{}"
+        )
+        return item
+
+    def get_generated_file(self, file_id: str) -> dict[str, Any]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM generated_files WHERE id = ?",
+                (file_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(file_id)
+        return self._decode_generated_file(row)
+
+    def list_generated_files(
+        self, conversation_id: str
+    ) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM generated_files
+                WHERE conversation_id = ?
+                ORDER BY created_at ASC, rowid ASC
+                """,
+                (conversation_id,),
+            ).fetchall()
+        return [self._decode_generated_file(row) for row in rows]
+
+    def list_message_generated_files(
+        self, message_id: str
+    ) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM generated_files
+                WHERE message_id = ?
+                ORDER BY created_at ASC, rowid ASC
+                """,
+                (message_id,),
+            ).fetchall()
+        return [self._decode_generated_file(row) for row in rows]
+
+    def list_generated_files_from_message(
+        self, conversation_id: str, message_id: str
+    ) -> list[dict[str, Any]]:
+        target = self.get_message(message_id)
+        if target["conversation_id"] != conversation_id:
+            raise KeyError(message_id)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT generated.*
+                FROM generated_files generated
+                JOIN messages message ON message.id = generated.message_id
+                WHERE generated.conversation_id = ? AND message.rowid >= ?
+                ORDER BY generated.created_at ASC, generated.rowid ASC
+                """,
+                (conversation_id, target["sequence_id"]),
+            ).fetchall()
+        return [self._decode_generated_file(row) for row in rows]
+
+    def set_generated_provider_file(
+        self, file_id: str, endpoint_id: str, provider_file_id: str
+    ) -> None:
+        file_row = self.get_generated_file(file_id)
+        provider_files = file_row["provider_files"]
+        provider_files[endpoint_id] = provider_file_id
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE generated_files
+                SET provider_files_json = ?
+                WHERE id = ?
+                """,
+                (json.dumps(provider_files), file_id),
+            )
+
+    # ------------------------------------------------------------------
+    # Server-owned response generation jobs
+    # ------------------------------------------------------------------
+
+    def create_generation_job(
+        self, conversation_id: str, user_message_id: str
+    ) -> dict[str, Any]:
+        job_id = str(uuid.uuid4())
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO generation_jobs (
+                    id, conversation_id, user_message_id, status,
+                    status_label, created_at, updated_at
+                ) VALUES (?, ?, ?, 'queued', 'Queued', ?, ?)
+                """,
+                (job_id, conversation_id, user_message_id, now, now),
+            )
+        return self.get_generation_job(job_id)
+
+    def get_generation_job(self, job_id: str) -> dict[str, Any]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM generation_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        return dict(row)
+
+    def get_active_generation_job(
+        self, conversation_id: str
+    ) -> dict[str, Any] | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM generation_jobs
+                WHERE conversation_id = ?
+                  AND status IN ('queued', 'running')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (conversation_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def update_generation_job(self, job_id: str, **values: Any) -> None:
+        allowed = {
+            "assistant_message_id",
+            "status",
+            "status_label",
+            "error",
+            "started_at",
+            "completed_at",
+        }
+        updates = {key: value for key, value in values.items() if key in allowed}
+        if not updates:
+            return
+        updates["updated_at"] = time.time()
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        parameters = list(updates.values()) + [job_id]
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE generation_jobs SET {assignments} WHERE id = ?",
+                parameters,
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(job_id)
+
+    def fail_interrupted_generation_jobs(self) -> list[dict[str, Any]]:
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM generation_jobs
+                WHERE status IN ('queued', 'running')
+                """
+            ).fetchall()
+            connection.execute(
+                """
+                UPDATE generation_jobs
+                SET status = 'failed',
+                    status_label = 'Interrupted',
+                    error = 'The application restarted before this response finished.',
+                    updated_at = ?,
+                    completed_at = ?
+                WHERE status IN ('queued', 'running')
+                """,
+                (now, now),
+            )
+        return [dict(row) for row in rows]
 
     # ------------------------------------------------------------------
     # Conversation attachments

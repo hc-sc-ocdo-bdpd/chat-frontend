@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import time
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable
 
 import httpx
-from .config import EndpointConfig, ModelConfig
 
+from .config import EndpointConfig, ModelConfig
 
 # Azure's Responses API has two different file paths:
 #
@@ -124,12 +126,50 @@ def upload_file(
     original_name: str,
 ) -> str:
     client = make_client(endpoint)
-    with file_path.open("rb") as handle:
-        uploaded = client.files.create(
-            file=(original_name, handle),
-            purpose="assistants",
+    try:
+        with file_path.open("rb") as handle:
+            uploaded = client.files.create(
+                file=(original_name, handle),
+                purpose="assistants",
+            )
+    except Exception as exc:
+        if not _is_invalid_extension_error(exc):
+            raise
+        uploaded = _upload_file_as_archive(
+            client,
+            file_path,
+            original_name,
         )
     return uploaded.id
+
+
+def _is_invalid_extension_error(exc: Exception) -> bool:
+    return (
+        getattr(exc, "status_code", None) == 400
+        and "invalid extension" in str(exc).lower()
+    )
+
+
+def _upload_file_as_archive(
+    client: Any,
+    file_path: Path,
+    original_name: str,
+) -> Any:
+    """Wrap an unsupported file so Code Interpreter can still access it."""
+    safe_name = Path(original_name).name or "retained-file"
+    with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024) as archive:
+        with zipfile.ZipFile(
+            archive,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            allowZip64=True,
+        ) as bundle:
+            bundle.write(file_path, arcname=safe_name)
+        archive.seek(0)
+        return client.files.create(
+            file=(f"{safe_name}.zip", archive),
+            purpose="assistants",
+        )
 
 
 def build_history_input(messages: Iterable[dict[str, Any]]) -> list[dict[str, str]]:
@@ -760,8 +800,16 @@ def download_generated_file(
         file_id=file_id,
         container_id=container_id,
     )
+    upstream_headers = getattr(upstream, "headers", None)
+    content_type = (
+        upstream_headers.get("content-type")
+        if upstream_headers is not None
+        else None
+    )
     return httpx.Response(
         status_code=200,
         content=upstream.read(),
-        headers={"content-type": "application/octet-stream"},
+        headers={
+            "content-type": content_type or "application/octet-stream"
+        },
     )
