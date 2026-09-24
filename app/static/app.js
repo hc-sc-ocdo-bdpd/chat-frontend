@@ -7,6 +7,8 @@ const state = {
   activeProjectFilter: "all",
   editingProjectId: null,
   pendingAttachments: [],
+  pendingAttachmentsByConversation: new Map(),
+  attachmentUploads: new Set(),
   generations: new Map(),
   generationConnections: new Map(),
   pendingGenerationConversations: new Set(),
@@ -37,6 +39,8 @@ const el = {
   settingsPanel: document.getElementById("settings-panel"),
   projectContext: document.getElementById("project-context"),
   pendingFiles: document.getElementById("pending-files"),
+  attachmentStatus: document.getElementById("attachment-status"),
+  fileDropOverlay: document.getElementById("file-drop-overlay"),
   fileInput: document.getElementById("file-input"),
   messageInput: document.getElementById("message-input"),
   sendButton: document.getElementById("send-button"),
@@ -471,10 +475,11 @@ function renderConversations() {
       event.stopPropagation();
       if (!confirm(`Delete "${conversation.title}"?`)) return;
       await api(`/api/conversations/${conversation.id}`, { method: "DELETE" });
+      state.pendingAttachmentsByConversation.delete(conversation.id);
       if (state.activeConversationId === conversation.id) {
         state.activeConversationId = null;
         state.activeConversation = null;
-        state.pendingAttachments = [];
+        setPendingAttachments([]);
       }
       await loadConversations();
       const next = filteredConversations()[0];
@@ -754,6 +759,86 @@ function createCodeBlock(language, codeText) {
   return wrapper;
 }
 
+function splitMarkdownTableRow(line) {
+  const row = line.trim();
+  const cells = [];
+  let cell = "";
+  let lastSeparator = -1;
+
+  for (let index = 0; index < row.length; index += 1) {
+    const character = row[index];
+    if (character === "\\" && index + 1 < row.length) {
+      // Escaped pipes belong to the cell, including inside inline code.
+      // Consume other escape pairs together so an escaped backslash does not
+      // accidentally escape the following column separator.
+      cell += row[index + 1] === "|" ? "|" : row.slice(index, index + 2);
+      index += 1;
+    } else if (character === "|") {
+      cells.push(cell.trim());
+      cell = "";
+      lastSeparator = index;
+    } else {
+      cell += character;
+    }
+  }
+
+  if (lastSeparator < 0) return null;
+  cells.push(cell.trim());
+  if (row.startsWith("|")) cells.shift();
+  if (lastSeparator === row.length - 1) cells.pop();
+  return cells;
+}
+
+function markdownTableHeader(headerLine, delimiterLine) {
+  if (delimiterLine === undefined) return null;
+  const headers = splitMarkdownTableRow(headerLine);
+  const delimiters = splitMarkdownTableRow(delimiterLine);
+  if (
+    !headers?.length ||
+    headers.length !== delimiters?.length ||
+    !delimiters.every((cell) => /^:?-+:?$/.test(cell))
+  ) {
+    return null;
+  }
+  return {
+    headers,
+    alignments: delimiters.map((cell) =>
+      cell.endsWith(":") ? (cell.startsWith(":") ? "center" : "right") : "left"
+    ),
+  };
+}
+
+function createMarkdownTable({ headers, alignments }, rows, generatedFiles) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "markdown-table-wrapper";
+  wrapper.tabIndex = 0;
+  wrapper.setAttribute("role", "region");
+  wrapper.setAttribute("aria-label", "Table, scroll horizontally for more columns");
+
+  const table = document.createElement("table");
+  table.className = "markdown-table";
+  const head = document.createElement("thead");
+  const body = document.createElement("tbody");
+
+  function appendRow(section, cells, header = false) {
+    const row = document.createElement("tr");
+    headers.forEach((_, index) => {
+      const cell = document.createElement(header ? "th" : "td");
+      if (header) cell.scope = "col";
+      cell.style.textAlign = alignments[index];
+      appendInlineMarkdown(cell, cells[index] || "", generatedFiles);
+      row.appendChild(cell);
+    });
+    section.appendChild(row);
+  }
+
+  appendRow(head, headers, true);
+  rows.forEach((cells) => appendRow(body, cells));
+  table.append(head, body);
+  wrapper.appendChild(table);
+  return wrapper;
+}
+
 function renderMarkdownBlocks(container, text, generatedFiles) {
   const lines = text.replace(/\r\n?/g, "\n").split("\n");
   let paragraphLines = [];
@@ -839,6 +924,26 @@ function renderMarkdownBlocks(container, text, generatedFiles) {
       continue;
     }
 
+    const tableHeader = markdownTableHeader(line, lines[lineIndex + 1]);
+    if (tableHeader) {
+      flushAll();
+      const rows = [];
+      lineIndex += 1;
+      while (lineIndex + 1 < lines.length) {
+        const nextLine = lines[lineIndex + 1];
+        // A new block ends the table, even if its text contains a pipe.
+        if (/^\s*(?:#{1,6}\s|>|[-+*]\s|\d+[.)]\s|`{3,}|~{3,})/.test(nextLine)) {
+          break;
+        }
+        const cells = splitMarkdownTableRow(nextLine);
+        if (!cells) break;
+        rows.push(cells);
+        lineIndex += 1;
+      }
+      container.appendChild(createMarkdownTable(tableHeader, rows, generatedFiles));
+      continue;
+    }
+
     const headingMatch = /^(#{1,6})\s+(.+)$/.exec(line);
     if (headingMatch) {
       flushAll();
@@ -913,7 +1018,8 @@ function renderMarkdownBlocks(container, text, generatedFiles) {
 function renderCodeAwareContent(container, text, generatedFiles = []) {
   container.classList.add("markdown-rendered");
 
-  const fencePattern = /```([A-Za-z0-9_+#.\-]*)\r?\n([\s\S]*?)```/g;
+  // Treat an unfinished fence as code while a response is streaming too.
+  const fencePattern = /(```|~~~)([A-Za-z0-9_+#.\-]*)\r?\n([\s\S]*?)(?:\1|$)/g;
   let cursor = 0;
   let match;
 
@@ -924,8 +1030,8 @@ function renderCodeAwareContent(container, text, generatedFiles = []) {
       generatedFiles
     );
 
-    const language = match[1] || "code";
-    const codeText = match[2].replace(/\r?\n$/, "");
+    const language = match[2] || "code";
+    const codeText = match[3].replace(/\r?\n$/, "");
     container.appendChild(createCodeBlock(language, codeText));
     cursor = fencePattern.lastIndex;
   }
@@ -1393,15 +1499,24 @@ function renderPendingFiles() {
     remove.textContent = "×";
     remove.title = "Remove from next message";
     remove.addEventListener("click", () => {
-      state.pendingAttachments = state.pendingAttachments.filter(
-        (item) => item.id !== attachment.id
+      setPendingAttachments(
+        state.pendingAttachments.filter((item) => item.id !== attachment.id)
       );
-      renderPendingFiles();
     });
 
     chip.append(name, remove);
     el.pendingFiles.appendChild(chip);
   });
+}
+
+function setPendingAttachments(attachments, conversationId = state.activeConversationId) {
+  if (conversationId) {
+    state.pendingAttachmentsByConversation.set(conversationId, attachments);
+  }
+  if (state.activeConversationId === conversationId) {
+    state.pendingAttachments = attachments;
+    renderPendingFiles();
+  }
 }
 
 function renderProjectContext() {
@@ -1664,7 +1779,9 @@ async function selectProjectFilter(filter) {
     } else {
       state.activeConversationId = null;
       state.activeConversation = null;
+      setPendingAttachments([]);
       renderEmpty();
+      updateComposerState();
     }
   } else {
     renderProjectContext();
@@ -1686,11 +1803,10 @@ async function createConversation() {
     }),
   });
 
-  state.pendingAttachments = [];
-  renderPendingFiles();
   await loadWorkspace();
   await openConversation(conversation.id);
   el.messageInput.focus();
+  return conversation.id;
 }
 
 async function openConversation(
@@ -1698,6 +1814,8 @@ async function openConversation(
   { clearPending = true, markRead = true } = {}
 ) {
   state.activeConversationId = id;
+  setPendingAttachments(state.pendingAttachmentsByConversation.get(id) || [], id);
+  updateComposerState();
   const conversation = await api(`/api/conversations/${id}`);
   if (state.activeConversationId !== id) return;
   state.activeConversation = conversation;
@@ -1721,8 +1839,7 @@ async function openConversation(
   }
 
   if (clearPending) {
-    state.pendingAttachments = [];
-    renderPendingFiles();
+    setPendingAttachments(state.pendingAttachmentsByConversation.get(id) || [], id);
   }
   renderConversations();
   renderProjectContext();
@@ -1735,30 +1852,101 @@ async function refreshActiveConversation() {
   await openConversation(state.activeConversationId, { clearPending: false });
 }
 
+let conversationCreationPromise = null;
+
 async function ensureConversation() {
-  if (!state.activeConversationId) {
-    await createConversation();
+  // Multiple paste/drop events on the welcome screen share one new chat.
+  if (state.activeConversationId) return state.activeConversationId;
+  if (conversationCreationPromise) return conversationCreationPromise;
+  conversationCreationPromise = createConversation();
+  try {
+    return await conversationCreationPromise;
+  } finally {
+    conversationCreationPromise = null;
   }
-  return state.activeConversationId;
 }
 
 async function uploadFiles(fileList) {
-  if (!fileList.length) return;
+  // Clipboard and drag data must be captured before the first await.
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+  const upload = { conversationId: state.activeConversationId, count: files.length };
+  state.attachmentUploads.add(upload);
+  updateComposerState();
 
-  const conversationId = await ensureConversation();
-  const form = new FormData();
-  Array.from(fileList).forEach((file) => form.append("files", file));
+  try {
+    const conversationId = upload.conversationId || await ensureConversation();
+    upload.conversationId = conversationId;
+    updateComposerState();
+    const form = new FormData();
+    files.forEach((file) => form.append("files", file));
 
-  showToast("Uploading files locally...");
-  const attachments = await api(
-    `/api/conversations/${conversationId}/attachments`,
-    { method: "POST", body: form }
-  );
-  state.pendingAttachments.push(...attachments);
-  renderPendingFiles();
-  showToast(
-    `${attachments.length} file${attachments.length === 1 ? "" : "s"} attached`
-  );
+    const attachments = await api(
+      `/api/conversations/${conversationId}/attachments`,
+      { method: "POST", body: form }
+    );
+    setPendingAttachments([
+      ...(state.pendingAttachmentsByConversation.get(conversationId) || []),
+      ...attachments,
+    ], conversationId);
+    showToast(
+      `${attachments.length} file${attachments.length === 1 ? "" : "s"} attached` +
+      (state.activeConversationId === conversationId ? "" : " to the original chat")
+    );
+  } finally {
+    state.attachmentUploads.delete(upload);
+    updateComposerState();
+  }
+}
+
+function activeUploadCount() {
+  return Array.from(state.attachmentUploads)
+    .filter((upload) =>
+      upload.conversationId === null || upload.conversationId === state.activeConversationId
+    )
+    .reduce((count, upload) => count + upload.count, 0);
+}
+
+function transferHasFiles(transfer) {
+  return Boolean(transfer && (
+    Array.from(transfer.types || []).includes("Files") ||
+    Array.from(transfer.items || []).some((item) => item.kind === "file") ||
+    transfer.files?.length
+  ));
+}
+
+function filesFromTransfer(transfer) {
+  if (!transfer) return [];
+  const items = Array.from(transfer.items || []);
+  if (items.some((item) => item.webkitGetAsEntry?.()?.isDirectory)) {
+    showToast("Choose files, or zip the folder before attaching it.");
+    return [];
+  }
+  // These expose the same files in most browsers. Use a fallback, not both,
+  // to avoid uploading each pasted or dropped file twice.
+  const files = Array.from(transfer.files || []);
+  return files.length ? files : items
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter(Boolean);
+}
+
+async function attachFiles(fileList) {
+  try {
+    await uploadFiles(fileList);
+  } catch (error) {
+    showToast(error.message || "Could not attach files. Please try again.");
+  }
+}
+
+function isChatDropTarget(target) {
+  return target instanceof Element &&
+    el.projectModal.classList.contains("hidden") &&
+    Boolean(target.closest("#messages, .composer-shell, #file-drop-overlay"));
+}
+
+function resetFileDrop() {
+  el.fileDropOverlay.classList.add("hidden");
 }
 
 function autosizeTextarea() {
@@ -1769,9 +1957,16 @@ function autosizeTextarea() {
 
 function updateComposerState() {
   const busy = isActiveConversationBusy();
+  const uploadCount = activeUploadCount();
   el.sendButton.classList.toggle("stop-mode", busy);
   el.sendButton.textContent = busy ? "■" : "↑";
-  el.sendButton.title = busy ? "Stop generation" : "Send";
+  el.sendButton.disabled = uploadCount > 0 && !busy;
+  el.sendButton.title = busy ? "Stop generation" : uploadCount ? "Uploading files" : "Send";
+  el.attachmentStatus.textContent = uploadCount
+    ? `Uploading ${uploadCount} file${uploadCount === 1 ? "" : "s"}...`
+    : "";
+  el.attachmentStatus.classList.toggle("hidden", !uploadCount);
+  el.pendingFiles.setAttribute("aria-busy", String(uploadCount > 0));
 }
 
 async function stopGeneration() {
@@ -1819,6 +2014,10 @@ async function sendMessageWithContent(
 
   const conversationId = await ensureConversation();
   if (isConversationBusy(conversationId)) return;
+  if (clearComposer && activeUploadCount()) {
+    showToast("Wait for your files to finish uploading before sending.");
+    return;
+  }
 
   const pendingBeforeSend = [...state.pendingAttachments];
   state.pendingGenerationConversations.add(conversationId);
@@ -1837,8 +2036,7 @@ async function sendMessageWithContent(
   const streaming = addStreamingAssistant();
 
   if (clearComposer) {
-    state.pendingAttachments = [];
-    renderPendingFiles();
+    setPendingAttachments([]);
     el.messageInput.value = "";
     autosizeTextarea();
   }
@@ -1891,8 +2089,7 @@ async function sendMessageWithContent(
       !el.messageInput.value.trim()
     ) {
       el.messageInput.value = cleaned;
-      state.pendingAttachments = pendingBeforeSend;
-      renderPendingFiles();
+      setPendingAttachments(pendingBeforeSend);
       autosizeTextarea();
     }
     showToast(error.message);
@@ -1903,6 +2100,10 @@ async function sendMessageWithContent(
 }
 
 async function sendMessage() {
+  if (activeUploadCount()) {
+    showToast("Wait for your files to finish uploading before sending.");
+    return;
+  }
   const content = el.messageInput.value;
   const attachmentIds = state.pendingAttachments.map((item) => item.id);
   await sendMessageWithContent(content, attachmentIds, {
@@ -2304,12 +2505,46 @@ el.sidebarToggle.addEventListener("click", () => {
 });
 
 el.fileInput.addEventListener("change", async () => {
-  try {
-    await uploadFiles(el.fileInput.files);
-  } catch (error) {
-    showToast(error.message);
-  } finally {
-    el.fileInput.value = "";
+  const files = Array.from(el.fileInput.files || []);
+  el.fileInput.value = "";
+  await attachFiles(files);
+});
+
+el.messageInput.addEventListener("paste", (event) => {
+  const files = filesFromTransfer(event.clipboardData);
+  if (!files.length) return; // Let the browser handle ordinary text paste.
+  event.preventDefault();
+  void attachFiles(files);
+});
+
+for (const eventName of ["dragenter", "dragover"]) {
+  document.addEventListener(eventName, (event) => {
+    if (!transferHasFiles(event.dataTransfer)) return;
+    // Prevent files dropped elsewhere on the page from navigating away.
+    event.preventDefault();
+    const accepted = isChatDropTarget(event.target);
+    event.dataTransfer.dropEffect = accepted ? "copy" : "none";
+    el.fileDropOverlay.classList.toggle("hidden", !accepted);
+  });
+}
+
+document.addEventListener("dragleave", (event) => {
+  if (!isChatDropTarget(event.relatedTarget)) resetFileDrop();
+});
+document.addEventListener("dragend", resetFileDrop);
+window.addEventListener("blur", resetFileDrop);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") resetFileDrop();
+});
+document.addEventListener("drop", (event) => {
+  resetFileDrop();
+  if (!transferHasFiles(event.dataTransfer)) return;
+  event.preventDefault();
+  if (!isChatDropTarget(event.target)) return;
+  const files = filesFromTransfer(event.dataTransfer);
+  if (files.length) {
+    el.messageInput.focus();
+    void attachFiles(files);
   }
 });
 

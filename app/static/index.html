@@ -91,8 +91,9 @@
       <section class="composer-shell">
         <div id="project-context" class="project-context hidden"></div>
         <div id="pending-files" class="pending-files"></div>
+        <div id="attachment-status" class="attachment-status hidden" role="status"></div>
         <div class="composer">
-          <textarea id="message-input" rows="1" placeholder="Message Foundry Chat"></textarea>
+          <textarea id="message-input" rows="1" placeholder="Message Foundry Chat, or paste files" aria-label="Message Foundry Chat"></textarea>
           <div class="composer-footer">
             <div class="composer-controls">
               <label class="composer-attach" title="Attach files">
@@ -118,6 +119,9 @@
           Tools are applied to this message. Verify important output.
         </div>
       </section>
+      <div id="file-drop-overlay" class="file-drop-overlay hidden" aria-hidden="true">
+        <div>Drop files to attach them to this chat</div>
+      </div>
     </main>
   </div>
 
