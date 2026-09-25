@@ -1651,3 +1651,8 @@ select,
     gap: 5px;
   }
 }
+
+/* Do not let browser scroll anchoring fight explicit chat viewport control. */
+.messages { overflow-anchor: none; }
+.jump-latest { position: absolute; bottom: 185px; left: 50%; transform: translateX(-50%); z-index: 5; border: 1px solid var(--border); border-radius: 20px; padding: 8px 16px; background: var(--panel, #fff); color: var(--text, #222); cursor: pointer; box-shadow: 0 2px 8px #0002; }
+.file-recovery-status { font-size: .85em; color: var(--muted, #666); white-space: normal; }

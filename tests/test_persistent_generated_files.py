@@ -144,7 +144,8 @@ def test_generated_file_is_saved_and_reattached_on_later_turn(
     monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
     sys.modules.pop("app.main", None)
 
-    from app import main
+    import importlib
+    main = importlib.import_module("app.main")
 
     first_response = SimpleNamespace(
         id="resp-1",

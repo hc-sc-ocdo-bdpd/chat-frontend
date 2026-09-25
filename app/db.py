@@ -136,9 +136,28 @@ class Database:
                 """
             )
 
+            for column in ("sandbox_path", "sha256"):
+                if not self._column_exists(connection, "generated_files", column):
+                    connection.execute(f"ALTER TABLE generated_files ADD COLUMN {column} TEXT")
+            for column in ("request_json", "snapshot_json"):
+                if not self._column_exists(connection, "generation_jobs", column):
+                    connection.execute(f"ALTER TABLE generation_jobs ADD COLUMN {column} TEXT NOT NULL DEFAULT '{{}}'")
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS conversation_containers (
+                    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                    endpoint_id TEXT NOT NULL, container_id TEXT NOT NULL, seen_at REAL NOT NULL,
+                    PRIMARY KEY (conversation_id, endpoint_id, container_id)
+                )
+            """)
+
             if not self._column_exists(connection, "conversations", "project_id"):
                 connection.execute(
                     "ALTER TABLE conversations ADD COLUMN project_id TEXT"
+                )
+
+            if not self._column_exists(connection, "generation_jobs", "diagnostics_json"):
+                connection.execute(
+                    "ALTER TABLE generation_jobs ADD COLUMN diagnostics_json TEXT NOT NULL DEFAULT '{}'"
                 )
 
             if not self._column_exists(connection, "conversations", "last_read_at"):
@@ -549,6 +568,9 @@ class Database:
                 INSERT INTO messages (
                     id, conversation_id, role, content, metadata_json, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET content=excluded.content,
+                    metadata_json=excluded.metadata_json
+                WHERE messages.conversation_id=excluded.conversation_id
                 """,
                 (
                     message_id,
@@ -560,30 +582,7 @@ class Database:
                 ),
             )
             for file_row in generated_files or []:
-                connection.execute(
-                    """
-                    INSERT INTO generated_files (
-                        id, conversation_id, message_id, original_name,
-                        stored_name, content_type, size_bytes,
-                        source_endpoint_id, source_container_id,
-                        source_file_id, provider_files_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        file_row["id"],
-                        conversation_id,
-                        message_id,
-                        file_row["original_name"],
-                        file_row["stored_name"],
-                        file_row.get("content_type"),
-                        int(file_row["size_bytes"]),
-                        file_row.get("source_endpoint_id"),
-                        file_row.get("source_container_id"),
-                        file_row.get("source_file_id"),
-                        json.dumps(file_row.get("provider_files") or {}),
-                        float(file_row.get("created_at") or now),
-                    ),
-                )
+                self._save_generated_file(connection, conversation_id, message_id, file_row)
             connection.execute(
                 "UPDATE conversations SET updated_at = ? WHERE id = ?",
                 (time.time(), conversation_id),
@@ -596,6 +595,63 @@ class Database:
             "metadata": metadata or {},
             "created_at": now,
         }
+
+    @staticmethod
+    def _save_generated_file(connection, conversation_id, message_id, file_row):
+        connection.execute("""
+            INSERT INTO generated_files (id, conversation_id, message_id, original_name,
+                stored_name, content_type, size_bytes, source_endpoint_id,
+                source_container_id, source_file_id, provider_files_json, created_at,
+                sandbox_path, sha256)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET message_id=excluded.message_id,
+                sandbox_path=excluded.sandbox_path, sha256=excluded.sha256
+            WHERE generated_files.conversation_id=excluded.conversation_id
+        """, (file_row["id"], conversation_id, message_id, file_row["original_name"],
+              file_row["stored_name"], file_row.get("content_type"), int(file_row["size_bytes"]),
+              file_row.get("source_endpoint_id"), file_row.get("source_container_id"),
+              file_row.get("source_file_id"), json.dumps(file_row.get("provider_files") or {}),
+              float(file_row.get("created_at") or time.time()), file_row.get("sandbox_path"),
+              file_row.get("sha256")))
+
+    def stage_generated_file(self, conversation_id, message_id, file_row):
+        # Anchor early downloads to the request until the assistant is saved.
+        # Both foreign keys survive a process restart and normal chat deletion.
+        with self._lock, self._connect() as connection:
+            owner = connection.execute("SELECT conversation_id FROM messages WHERE id=?", (message_id,)).fetchone()
+            if owner is None or owner["conversation_id"] != conversation_id:
+                raise KeyError(message_id)
+            self._save_generated_file(connection, conversation_id, message_id, file_row)
+
+    def attach_recovered_file(self, conversation_id, message_id, file_row, download):
+        with self._lock, self._connect() as connection:
+            message = connection.execute("SELECT * FROM messages WHERE id=? AND conversation_id=?",
+                                         (message_id, conversation_id)).fetchone()
+            if message is None:
+                raise KeyError(message_id)
+            metadata = json.loads(message["metadata_json"])
+            files = metadata.setdefault("generated_files", [])
+            if not any(f.get("id") == file_row["id"] for f in files):
+                files.append(download)
+            exists = connection.execute("SELECT id FROM generated_files WHERE id=?", (file_row["id"],)).fetchone()
+            if not exists:
+                self._save_generated_file(connection, conversation_id, message_id, file_row)
+            else:
+                connection.execute("UPDATE generated_files SET sandbox_path=COALESCE(sandbox_path, ?) WHERE id=? AND conversation_id=?",
+                                   (file_row.get("sandbox_path"), file_row["id"], conversation_id))
+            connection.execute("UPDATE messages SET metadata_json=? WHERE id=?", (json.dumps(metadata), message_id))
+        return self.get_message(message_id)
+
+    def remember_containers(self, conversation_id, endpoint_id, container_ids):
+        with self._lock, self._connect() as connection:
+            connection.executemany("""INSERT INTO conversation_containers VALUES (?, ?, ?, ?)
+                ON CONFLICT(conversation_id, endpoint_id, container_id) DO UPDATE SET seen_at=excluded.seen_at""",
+                [(conversation_id, endpoint_id, cid, time.time()) for cid in container_ids])
+
+    def list_containers(self, conversation_id, endpoint_id):
+        with self._lock, self._connect() as connection:
+            return [r[0] for r in connection.execute("""SELECT container_id FROM conversation_containers
+                WHERE conversation_id=? AND endpoint_id=? ORDER BY seen_at DESC""", (conversation_id, endpoint_id))]
 
     def update_message_metadata(
         self, message_id: str, metadata: dict[str, Any]
@@ -812,7 +868,10 @@ class Database:
             ).fetchone()
         if row is None:
             raise KeyError(job_id)
-        return dict(row)
+        result = dict(row)
+        for name in ("diagnostics", "request", "snapshot"):
+            result[name] = json.loads(result.pop(name + "_json", "{}"))
+        return result
 
     def get_active_generation_job(
         self, conversation_id: str
@@ -831,7 +890,11 @@ class Database:
         return dict(row) if row is not None else None
 
     def update_generation_job(self, job_id: str, **values: Any) -> None:
+        for name in ("diagnostics", "request", "snapshot"):
+            if name in values:
+                values[name + "_json"] = json.dumps(values.pop(name), ensure_ascii=False)
         allowed = {
+            "diagnostics_json", "request_json", "snapshot_json",
             "assistant_message_id",
             "status",
             "status_label",
@@ -852,6 +915,15 @@ class Database:
             )
             if cursor.rowcount == 0:
                 raise KeyError(job_id)
+
+    def delete_staged_generated_file(self, file_id, owner_id):
+        with self._lock, self._connect() as connection:
+            connection.execute("DELETE FROM generated_files WHERE id=? AND message_id=?", (file_id, owner_id))
+
+    def list_active_generation_jobs(self):
+        with self._lock, self._connect() as connection:
+            ids = [r[0] for r in connection.execute("SELECT id FROM generation_jobs WHERE status IN ('queued', 'running')")]
+        return [self.get_generation_job(job_id) for job_id in ids]
 
     def fail_interrupted_generation_jobs(self) -> list[dict[str, Any]]:
         now = time.time()

@@ -32,5 +32,5 @@ def test_readme_documents_automatic_model_discovery() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
     assert "AZURE_OPENAI_DEPLOYMENT_1" in readme
     assert "AZURE_OPENAI_DEPLOYMENT_2" in readme
-    assert "No YAML editing is required to add a model" in readme
+    assert "config/models.yaml" in readme
     assert "Python 3.10 or newer" in readme

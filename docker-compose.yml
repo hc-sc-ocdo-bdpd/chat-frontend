@@ -1,11 +1,10 @@
-name: foundry-chat-python
+name: chat
 
 services:
   app:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: foundry-chat-python
     restart: unless-stopped
     env_file:
       - .env

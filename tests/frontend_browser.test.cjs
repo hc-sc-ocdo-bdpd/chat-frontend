@@ -27,6 +27,10 @@ function conversation(id) {
 
 before(async () => {
   server = createServer(async (req, res) => {
+    if (req.url === "/test-download.csv") {
+      res.writeHead(200, { "Content-Type": "text/csv", "Content-Disposition": "attachment; filename=result.csv" });
+      res.end("value\n42\n"); return;
+    }
     const files = { "/": "index.html", "/static/app.js": "app.js",
       "/static/reliability.js": "reliability.js", "/static/styles.css": "styles.css" };
     const name = files[new URL(req.url, "http://localhost").pathname];
@@ -40,7 +44,7 @@ before(async () => {
   baseURL = `http://127.0.0.1:${server.address().port}`;
   browser = await chromium.launch({
     executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
-    args: ["--no-sandbox", "--disable-dev-shm-usage"],
+    args: process.env.PLAYWRIGHT_CHROMIUM_ARGS ? JSON.parse(process.env.PLAYWRIGHT_CHROMIUM_ARGS) : ["--no-sandbox", "--disable-dev-shm-usage"],
   });
 });
 
@@ -379,4 +383,131 @@ test("an upload failure clears busy state and allows a successful retry", async 
   await transfer("paste", [{ name: "retry.txt" }]);
   await page.locator(".pending-file").waitFor();
   assert.equal(await page.locator(".pending-file span").textContent(), "retry.txt");
+});
+
+async function longChat() {
+  const messages = Array.from({ length: 55 }, (_, i) => ({ id: `history-${i}`, role: i % 2 ? "assistant" : "user",
+    content: `Historical message ${i}\n\n` + "Readable conversation history. ".repeat(12), metadata: {} }));
+  fixture.conversations[0].messages = messages;
+  await page.evaluate(async () => {
+    await openConversation("a");
+    const generation = registerGeneration({ id: "working", conversation_id: "a", status: "running", last_sequence: 0 });
+    attachGenerationView(generation);
+    window.testGeneration = generation;
+  });
+  await page.waitForTimeout(80);
+  await page.locator("#messages").hover();
+  await page.mouse.wheel(0, -1100);
+  await page.waitForTimeout(120);
+  return await page.locator("#messages").evaluate((node) => node.scrollTop);
+}
+
+test("scrolling up stays put through output, reasoning, status polls and completion", async () => {
+  const top = await longChat();
+  assert.ok(top > 0);
+  for (let i = 0; i < 7; i++) {
+    await page.evaluate((i) => {
+      const g = window.testGeneration;
+      applyGenerationEvent(g, { type: "reasoning_delta", delta: `Step ${i}. `, sequence: i * 2 + 1 });
+      applyGenerationEvent(g, { type: "output_delta", delta: `Answer ${i}.\n\n`, sequence: i * 2 + 2 });
+      updateGenerationView(g); // The same path used by the status refresh.
+    }, i);
+    await page.waitForTimeout(450);
+  }
+  assert.ok(Math.abs(await page.locator("#messages").evaluate(n => n.scrollTop) - top) < 2);
+  fixture.conversations[0].messages.push({ id: "final", role: "assistant", content: "Completed.\n\n".repeat(30), metadata: {} });
+  await page.evaluate(async () => {
+    window.testGeneration.status = "completed";
+    await finalizeGeneration(window.testGeneration);
+  });
+  await page.waitForTimeout(80);
+  assert.ok(Math.abs(await page.locator("#messages").evaluate(n => n.scrollTop) - top) < 2, "Completion must preserve the reading position");
+  await page.locator(".jump-latest").click();
+  await page.waitForTimeout(60);
+  assert.ok(await page.locator("#messages").evaluate(n => n.scrollHeight - n.clientHeight - n.scrollTop < 2));
+});
+
+test("a queued render cannot pull a user down after they scroll up", async () => {
+  await longChat();
+  const top = await page.locator("#messages").evaluate(n => n.scrollTop);
+  await page.evaluate(() => {
+    const g = window.testGeneration;
+    followLatest = true;
+    g.assistantText = "Queued rendering";
+    updateGenerationView(g);
+    el.messages.dispatchEvent(new WheelEvent("wheel", { deltaY: -500 }));
+  });
+  await page.waitForTimeout(80);
+  assert.ok(Math.abs(await page.locator("#messages").evaluate(n => n.scrollTop) - top) < 2);
+});
+
+test("scroll position is restored when returning to a running chat", async () => {
+  const top = await longChat();
+  await page.evaluate(async () => { await openConversation("b"); await openConversation("a"); });
+  await page.waitForTimeout(80);
+  assert.ok(Math.abs(await page.locator("#messages").evaluate(n => n.scrollTop) - top) < 2);
+});
+
+test("sandbox downloads use exact paths and accept escaped Markdown links", async () => {
+  const source = "**[Download report]\\(sandbox:/mnt/data/report.zip)**";
+  await render(source, [{ id: "zip", filename: "report.zip",
+    sandbox_path: "/mnt/data/report.zip", url: "/api/files/zip" }]);
+  const link = page.locator(".message-download-link");
+  assert.equal(await link.count(), 1);
+  assert.equal(await link.getAttribute("href"), "/api/files/zip");
+  assert.equal(await link.innerText(), "Download report");
+});
+
+test("uncited sandbox links recover through the UI and download actual bytes", async () => {
+  let recoveryCalls = 0;
+  await page.route("**/api/conversations/a/messages/answer/files/recover", async route => {
+    recoveryCalls++;
+    assert.equal(route.request().postDataJSON().sandbox_path, "sandbox:/mnt/data/result.csv");
+    await route.fulfill({ json: { url: "/test-download.csv", filename: "result.csv" } });
+  });
+  await render("[Get CSV]\\(sandbox:/mnt/data/result.csv)");
+  const downloading = page.waitForEvent("download");
+  await page.locator(".message-download-link").click();
+  const downloaded = await downloading;
+  assert.equal(downloaded.suggestedFilename(), "result.csv");
+  assert.equal((await readFile(await downloaded.path())).toString(), "value\n42\n");
+  assert.equal(recoveryCalls, 1);
+  await page.locator(".message-download-link").click();
+  assert.equal(recoveryCalls, 1, "Subsequent clicks should use the retained file URL");
+});
+
+test("expired sandbox files show a useful error without navigating away", async () => {
+  await page.route("**/files/recover", route => route.fulfill({ status: 410, json: { detail: "The sandbox has expired." } }));
+  await render("[Get ZIP](sandbox:/mnt/data/expired.zip)");
+  await page.locator(".message-download-link").click();
+  await page.getByText("The sandbox has expired. Click the link to retry.").waitFor();
+  assert.equal(page.url(), `${baseURL}/`);
+});
+
+test("stale status snapshots cannot revive a completed generation", async () => {
+  assert.equal(await page.evaluate(() => {
+    registerGeneration({ id: "done", conversation_id: "a", status: "completed", last_sequence: 100 });
+    return registerGeneration({ id: "done", conversation_id: "a", status: "running", last_sequence: 90 }).status;
+  }), "completed");
+});
+
+test("duplicate browser stream events never duplicate output", async () => {
+  assert.equal(await page.evaluate(() => {
+    const g = registerGeneration({ id: "duplicates", conversation_id: "a", status: "running", last_sequence: 0 });
+    applyGenerationEvent(g, { type: "output_delta", delta: "Once", sequence: 1 });
+    applyGenerationEvent(g, { type: "output_delta", delta: "Once", sequence: 1 });
+    return g.assistantText;
+  }), "Once");
+});
+
+test("recovery snapshots replace text and reset a stale cursor after restart", async () => {
+  const result = await page.evaluate(() => {
+    const g = registerGeneration({ id: "restored", conversation_id: "a", status: "running", last_sequence: 100,
+      assistant_text: "Text from before restart" });
+    applyGenerationEvent(g, { type: "snapshot", snapshot: { status: "running", last_sequence: 98,
+      assistant_text: "Saved text", reasoning_summary: "Saved summary", activities: [] } });
+    applyGenerationEvent(g, { type: "output_delta", delta: " and continuation", sequence: 99 });
+    return { text: g.assistantText, sequence: g.lastSequence };
+  });
+  assert.deepEqual(result, { text: "Saved text and continuation", sequence: 99 });
 });

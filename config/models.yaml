@@ -1,5 +1,5 @@
 app:
-  title: Foundry Chat
+  title: Chat
   default_instructions: >-
     You are a helpful assistant. Use available tools when they materially help.
     Focus on the user's requested outcome.

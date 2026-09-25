@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import threading
 import time
+import logging
+from collections import deque
 from collections.abc import Iterator
 from typing import Any
 
@@ -22,6 +24,7 @@ class GenerationJob:
         self,
         row: dict[str, Any],
         user_message: dict[str, Any],
+        on_checkpoint=None,
     ) -> None:
         self.id = str(row["id"])
         self.conversation_id = str(row["conversation_id"])
@@ -34,10 +37,14 @@ class GenerationJob:
         self.assistant_message_id = row.get("assistant_message_id")
         self.error = row.get("error")
 
-        self.assistant_text = ""
-        self.reasoning_summary = ""
-        self.activities: list[str] = []
-        self._events: list[dict[str, Any]] = []
+        saved = row.get("snapshot") or {}
+        self.assistant_text = saved.get("assistant_text", "")
+        self.reasoning_summary = saved.get("reasoning_summary", "")
+        self.activities = list(saved.get("activities", []))
+        self._sequence = int(saved.get("last_sequence", 0))
+        self._events = deque(maxlen=2048)
+        self._on_checkpoint = on_checkpoint
+        self._last_checkpoint = 0.0
         self._condition = threading.Condition(threading.RLock())
         self.cancel_event = threading.Event()
         self._cancel_callback: Any | None = None
@@ -54,7 +61,7 @@ class GenerationJob:
                 "completed_at": self.completed_at,
                 "assistant_message_id": self.assistant_message_id,
                 "error": self.error,
-                "last_sequence": len(self._events),
+                "last_sequence": self._sequence,
             }
             if include_output:
                 result.update(
@@ -87,6 +94,8 @@ class GenerationJob:
                     self.activities.append(label)
                 if label:
                     self.status_label = label
+            elif event_type == "output_snapshot":
+                self.assistant_text = str(event.get("text") or "")
             elif event_type == "output_delta":
                 self.assistant_text += str(event.get("delta") or "")
                 self.status_label = "Writing response"
@@ -112,10 +121,20 @@ class GenerationJob:
 
             event["generation_id"] = self.id
             event["conversation_id"] = self.conversation_id
-            event["sequence"] = len(self._events) + 1
+            self._sequence += 1
+            event["sequence"] = self._sequence
             self._events.append(event)
             self._condition.notify_all()
+            self.checkpoint(force=self.status in TERMINAL_GENERATION_STATUSES)
             return dict(event)
+
+    def checkpoint(self, *, force=False):
+        if self._on_checkpoint and (force or time.monotonic() - self._last_checkpoint >= 1.0):
+            try:
+                self._on_checkpoint(self.snapshot())
+                self._last_checkpoint = time.monotonic()
+            except Exception:
+                logging.getLogger(__name__).warning("Could not checkpoint generation %s", self.id, exc_info=True)
 
     def request_cancel(self) -> None:
         self.cancel_event.set()
@@ -133,20 +152,37 @@ class GenerationJob:
     def set_cancel_callback(self, callback: Any | None) -> None:
         with self._condition:
             self._cancel_callback = callback
+            already_cancelled = self.cancel_event.is_set()
+        if already_cancelled and callable(callback):
+            callback()
 
     def event_stream(self, after: int = 0) -> Iterator[str]:
         cursor = max(0, int(after))
+        # New processes and bounded event logs need a full replacement snapshot.
+        # Sending it even when the client's cursor is ahead prevents stale cursors
+        # from hiding updates after a process restart.
+        with self._condition:
+            needs_snapshot = cursor > self._sequence or (self._events and cursor < self._events[0]["sequence"] - 1)
+            if needs_snapshot:
+                snapshot = self.snapshot()
+                cursor = snapshot["last_sequence"]
+        if needs_snapshot:
+            yield f"data: {json.dumps({'type': 'snapshot', 'snapshot': snapshot})}\n\n"
 
         while True:
             with self._condition:
                 while (
-                    len(self._events) <= cursor
+                    self._sequence <= cursor
                     and self.status in ACTIVE_GENERATION_STATUSES
                 ):
                     notified = self._condition.wait(timeout=15.0)
                     if not notified:
                         break
 
+                snapshot = None
+                if self._events and cursor < self._events[0]["sequence"] - 1:
+                    snapshot = self.snapshot()
+                    cursor = snapshot["last_sequence"]
                 events = [
                     dict(event)
                     for event in self._events
@@ -154,6 +190,8 @@ class GenerationJob:
                 ]
                 terminal = self.status in TERMINAL_GENERATION_STATUSES
 
+            if snapshot is not None:
+                yield f"data: {json.dumps({'type': 'snapshot', 'snapshot': snapshot})}\n\n"
             if not events:
                 if terminal:
                     return
@@ -164,7 +202,7 @@ class GenerationJob:
                 cursor = int(event["sequence"])
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
-            if terminal and cursor >= len(self._events):
+            if terminal and cursor >= self._sequence:
                 return
 
     def wait(self, timeout: float | None = None) -> bool:

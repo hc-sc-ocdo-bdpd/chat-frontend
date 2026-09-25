@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import mimetypes
 import os
@@ -8,7 +9,10 @@ import shutil
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import uvicorn
@@ -18,7 +22,12 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import AppConfig, EndpointConfig, ModelConfig, load_config
+from . import artifacts
+from .file_bundles import SourceFile, bundle_prompt, plan_files, upload_bundle
+from .response_stream import ResumableResponseStream
+from .provider import make_client
 from .db import Database
+from .diagnostics import error_details, failure_message, field, response_details
 from .jobs import (
     ACTIVE_GENERATION_STATUSES,
     TERMINAL_GENERATION_STATUSES,
@@ -35,6 +44,7 @@ from .provider import (
     web_activity_labels,
 )
 from .schemas import (
+    FileRecover,
     ConversationCreate,
     ConversationUpdate,
     MessageCreate,
@@ -56,7 +66,7 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-logger = logging.getLogger("foundry-chat")
+logger = logging.getLogger("chat")
 
 STATIC_DIR = BASE_DIR / "static"
 DATA_DIR = Path(os.getenv("APP_DATA_DIR", str(PROJECT_ROOT / "data")))
@@ -72,25 +82,6 @@ GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 
 config: AppConfig = load_config(CONFIG_PATH)
 db = Database(DATA_DIR / "app.db")
-for interrupted_job in db.fail_interrupted_generation_jobs():
-    if interrupted_job.get("assistant_message_id"):
-        continue
-    try:
-        interrupted_message = db.add_message(
-            interrupted_job["conversation_id"],
-            "assistant",
-            "Request interrupted because the application restarted before it finished.",
-            {"error": True, "interrupted": True},
-        )
-        db.update_generation_job(
-            interrupted_job["id"],
-            assistant_message_id=interrupted_message["id"],
-        )
-    except KeyError:
-        logger.warning(
-            "Could not record interrupted generation %s",
-            interrupted_job["id"],
-        )
 provider_reconciliation = db.reconcile_provider_ids(
     valid_models={
         endpoint.id: set(endpoint.models)
@@ -106,9 +97,35 @@ if any(provider_reconciliation.values()):
         provider_reconciliation["projects"],
     )
 
-app = FastAPI(title=config.title)
+@asynccontextmanager
+async def lifespan(_app):
+    _shutting_down.clear()
+    restore_generations()
+    yield
+    _shutting_down.set()
+    # Keep Azure background requests running. A new process attaches by ID.
+    for job in list(_generations.values()):
+        job.checkpoint(force=True)
+        stream = getattr(job, "provider_stream", None)
+        if stream is not None:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+
+app = FastAPI(title=config.title, lifespan=lifespan)
+
+@app.middleware("http")
+async def fresh_client_assets(request, call_next):
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+_shutting_down = threading.Event()
+_file_recovery_lock = threading.RLock()
 _generation_lock = threading.RLock()
 _generations: dict[str, GenerationJob] = {}
 _active_generation_by_conversation: dict[str, str] = {}
@@ -118,7 +135,7 @@ def get_endpoint_and_model(
     endpoint_id: str | None, model_id: str | None
 ) -> tuple[EndpointConfig, ModelConfig]:
     # The application intentionally exposes one shared Azure connection. The
-    # endpoint ID remains in stored metadata for backward compatibility only.
+    # Endpoint IDs identify the connection in stored metadata.
     endpoint = config.endpoints[config.default_endpoint]
     resolved_model_id = model_id or config.default_model
     model = endpoint.models.get(resolved_model_id)
@@ -160,22 +177,8 @@ def validate_message_options(payload: MessageCreate, model: ModelConfig) -> None
 
 
 def stream_event_error(event: Any) -> str:
-    try:
-        raw = event.model_dump()
-    except Exception:
-        raw = {}
-
-    error = raw.get("error")
-    if isinstance(error, dict):
-        return str(error.get("message") or error.get("code") or error)
-    if error:
-        return str(error)
-
-    return str(
-        raw.get("message")
-        or getattr(event, "message", None)
-        or "The model stream failed"
-    )
+    response = field(event, "response")
+    return failure_message(response) if response is not None else error_details(event)["message"]
 
 
 def sanitize_filename(filename: str) -> str:
@@ -257,44 +260,30 @@ def prepare_provider_files(
             provider_file_ids.append(provider_file_id)
         named_provider_files.append((file_row, provider_file_id))
 
-    for attachment in attachments:
-        provider_file_id = attachment["provider_files"].get(endpoint.id)
-        if not provider_file_id:
-            provider_file_id = upload_file(
-                endpoint,
-                UPLOAD_DIR / attachment["stored_name"],
-                attachment["original_name"],
+    sources = [
+        SourceFile(kind, row, directory / row["stored_name"])
+        for kind, rows, directory in (
+            ("attachment", attachments, UPLOAD_DIR),
+            ("project", project_files, UPLOAD_DIR),
+            ("generated", generated_files, GENERATED_DIR),
+        )
+        for row in rows
+    ]
+    setters = {"attachment": db.set_provider_file,
+               "project": db.set_project_provider_file,
+               "generated": db.set_generated_provider_file}
+    for item in plan_files(sources):
+        if isinstance(item, list):
+            row, provider_file_id = upload_bundle(
+                endpoint, item, DATA_DIR / "file-bundles", upload_file
             )
-            db.set_provider_file(
-                attachment["id"], endpoint.id, provider_file_id
-            )
-        add_file(attachment, provider_file_id)
-
-    for project_file in project_files:
-        provider_file_id = project_file["provider_files"].get(endpoint.id)
-        if not provider_file_id:
-            provider_file_id = upload_file(
-                endpoint,
-                UPLOAD_DIR / project_file["stored_name"],
-                project_file["original_name"],
-            )
-            db.set_project_provider_file(
-                project_file["id"], endpoint.id, provider_file_id
-            )
-        add_file(project_file, provider_file_id)
-
-    for generated_file in generated_files:
-        provider_file_id = generated_file["provider_files"].get(endpoint.id)
-        if not provider_file_id:
-            provider_file_id = upload_file(
-                endpoint,
-                GENERATED_DIR / generated_file["stored_name"],
-                generated_file["original_name"],
-            )
-            db.set_generated_provider_file(
-                generated_file["id"], endpoint.id, provider_file_id
-            )
-        add_file(generated_file, provider_file_id)
+        else:
+            row = item.row
+            provider_file_id = row["provider_files"].get(endpoint.id)
+            if not provider_file_id:
+                provider_file_id = upload_file(endpoint, item.path, row["original_name"])
+                setters[item.kind](row["id"], endpoint.id, provider_file_id)
+        add_file(row, provider_file_id)
 
     return provider_file_ids, named_provider_files
 
@@ -308,6 +297,9 @@ def build_input_payload(
     current_content: list[dict[str, str]] = [
         {"type": "input_text", "text": payload.content.strip()}
     ]
+    archive_context = bundle_prompt(named_provider_files)
+    if archive_context:
+        current_content.append({"type": "input_text", "text": archive_context})
     current_content.extend(
         {"type": "input_file", "file_id": provider_file_id}
         for file_row, provider_file_id in named_provider_files
@@ -340,6 +332,7 @@ def generated_file_metadata(
     return {
         "id": file_row["id"],
         "filename": file_row["original_name"],
+        "sandbox_path": file_row.get("sandbox_path"),
         "content_type": file_row.get("content_type"),
         "size_bytes": int(file_row["size_bytes"]),
         "url": (
@@ -349,85 +342,110 @@ def generated_file_metadata(
     }
 
 
-def persist_generated_files(
-    endpoint: EndpointConfig,
-    response: Any,
-    conversation_id: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Download generated bytes before Azure's container can expire."""
-    sources = extract_generated_files(response)
-    if not sources:
-        return [], []
+def response_ids_for_message(conversation_id, message_id=None):
+    messages = (db.list_messages_through(conversation_id, message_id) if message_id
+                else db.list_messages(conversation_id))
+    return [m["metadata"]["response_id"] for m in reversed(messages)
+            if m.get("metadata", {}).get("response_id")]
 
-    destination_dir = GENERATED_DIR / conversation_id
-    destination_dir.mkdir(parents=True, exist_ok=True)
-    records: list[dict[str, Any]] = []
 
+def persist_generated_files(endpoint, response, conversation_id, *, owner_id=None, errors=None):
+    errors = errors if errors is not None else []
+    containers, _, paths = artifacts.references(response)
+    db.remember_containers(conversation_id, endpoint.id, containers)
     try:
-        for source in sources:
-            original_name = sanitize_filename(source["filename"])
-            retained_id = str(uuid.uuid4())
-            stored_name = str(
-                Path(conversation_id) / f"{retained_id}_{original_name}"
-            )
-            destination = GENERATED_DIR / stored_name
-            temporary = destination.with_name(destination.name + ".part")
+        sources = extract_generated_files(response, endpoint=endpoint)
+    except Exception as exc:
+        errors.append({"error": type(exc).__name__, "operation": "discover files"})
+        sources = artifacts.references(response)[1]
+    covered = {s.get("sandbox_path") for s in sources}
+    for path in sorted(paths - covered):
+        try:
+            ids = [field(response, "id")] + response_ids_for_message(conversation_id)
+            sources.append(artifacts.find_in_history(endpoint, ids, path, db.list_containers(conversation_id, endpoint.id)))
+        except Exception as exc:
+            errors.append({"filename": path, "error": str(exc)})
+    records = artifacts.retain_sources(endpoint, sources, GENERATED_DIR, conversation_id,
+                                       download_generated_file, database=db, owner_id=owner_id, errors=errors)
+    return records, [generated_file_metadata(conversation_id, record) for record in records]
 
-            last_error: Exception | None = None
-            upstream: Any | None = None
-            for attempt in range(3):
-                try:
-                    upstream = download_generated_file(
-                        endpoint,
-                        source["container_id"],
-                        source["file_id"],
-                    )
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    if attempt < 2:
-                        time.sleep(0.25 * (2**attempt))
 
-            if upstream is None:
-                raise RuntimeError(
-                    f"Could not retain generated file {original_name}: {last_error}"
-                )
+def capture_code_files(endpoint, item, conversation_id, owner_id, errors):
+    containers, citations, _ = artifacts.references(item)
+    db.remember_containers(conversation_id, endpoint.id, containers)
+    try:
+        with make_client(endpoint).with_options(timeout=30.0, max_retries=0) as client:
+            sources = artifacts.list_sources(client, containers)
+        artifacts.retain_sources(endpoint, sources + citations, GENERATED_DIR, conversation_id,
+                                 download_generated_file, database=db, owner_id=owner_id, errors=errors)
+    except Exception as exc:
+        errors.append({"operation": "early file capture", "error": type(exc).__name__})
 
-            content = bytes(upstream.content)
-            with temporary.open("wb") as output:
-                output.write(content)
-                output.flush()
-                os.fsync(output.fileno())
-            temporary.replace(destination)
 
-            content_type = upstream.headers.get("content-type")
-            if not content_type or content_type == "application/octet-stream":
-                content_type = mimetypes.guess_type(original_name)[0]
+def finish_file_capture(job, records, downloads):
+    # Early files remain usable even if the final Azure response fails or omits citations.
+    present = {r["id"] for r in records}
+    versions = {(r.get("source_container_id"), r.get("source_file_id")) for r in records}
+    for row in db.list_message_generated_files(job.user_message["id"]):
+        if row["id"] not in present:
+            if (row.get("source_container_id"), row.get("source_file_id")) in versions:
+                db.delete_staged_generated_file(row["id"], job.user_message["id"])
+                remove_generated_file_bytes([row])
+                continue
+            records.append(row)
+            downloads.append(generated_file_metadata(job.conversation_id, row))
+    # Reused files already associated with earlier assistant messages stay there.
+    return [r for r in records if not r.get("message_id") or r["message_id"] == job.user_message["id"]], downloads
 
-            records.append(
-                {
-                    "id": retained_id,
-                    "original_name": original_name,
-                    "stored_name": stored_name,
-                    "content_type": content_type or "application/octet-stream",
-                    "size_bytes": len(content),
-                    "source_endpoint_id": endpoint.id,
-                    "source_container_id": source["container_id"],
-                    "source_file_id": source["file_id"],
-                    "provider_files": {},
-                    "created_at": time.time(),
-                }
-            )
-    except Exception:
-        for record in records:
-            (GENERATED_DIR / record["stored_name"]).unlink(missing_ok=True)
-        for temporary in destination_dir.glob("*.part"):
-            temporary.unlink(missing_ok=True)
-        raise
 
-    return records, [
-        generated_file_metadata(conversation_id, record) for record in records
-    ]
+@app.post("/api/conversations/{conversation_id}/messages/{message_id}/files/recover")
+def recover_message_file(conversation_id: str, message_id: str, payload: FileRecover):
+    with _file_recovery_lock:
+        try:
+            message = db.get_message(message_id)
+            conversation = db.get_conversation(conversation_id)
+        except KeyError:
+            raise HTTPException(404, "Conversation or message not found")
+        path = artifacts._container_path(payload.sandbox_path)
+        if message["conversation_id"] != conversation_id or message["role"] != "assistant":
+            raise HTTPException(404, "Message not found")
+        if not path or path not in artifacts.linked_paths(message["content"]):
+            raise HTTPException(400, "The requested sandbox path is not linked in this message")
+        local = db.list_generated_files(conversation_id)
+        by_id = {f["id"]: f for f in local}
+        metadata_files = message.get("metadata", {}).get("generated_files", [])
+        candidates = [by_id[f["id"]] for f in metadata_files if f.get("sandbox_path") == path and f.get("id") in by_id]
+        if not candidates:
+            candidates = [f for f in local if f.get("sandbox_path") == path]
+        if not candidates:
+            # A filename can identify a retained file when its path is absent.
+            candidates = [f for f in local if not f.get("sandbox_path") and f["original_name"] == Path(path).name]
+        candidates = [f for f in candidates if (GENERATED_DIR / f["stored_name"]).is_file()]
+        if len(candidates) == 1:
+            record = {**candidates[0], "sandbox_path": path}
+        else:
+            endpoint_id = message.get("metadata", {}).get("endpoint_id") or conversation["endpoint_id"]
+            endpoint = config.endpoints.get(endpoint_id)
+            if endpoint is None:
+                raise HTTPException(409, "The Azure connection used by this message is no longer configured")
+            try:
+                source = artifacts.find_in_history(endpoint, response_ids_for_message(conversation_id, message_id), path,
+                                                   db.list_containers(conversation_id, endpoint.id))
+                errors = []
+                records = artifacts.retain_sources(endpoint, [source], GENERATED_DIR, conversation_id,
+                                                    download_generated_file, database=db, errors=errors)
+                if not records:
+                    raise RuntimeError("Azure located the file but downloading it failed. Try the link again.")
+                record = records[0]
+            except FileNotFoundError as exc:
+                raise HTTPException(410, str(exc))
+            except ValueError as exc:
+                raise HTTPException(409, str(exc))
+            except Exception as exc:
+                raise HTTPException(502, str(exc))
+        download = generated_file_metadata(conversation_id, record)
+        db.attach_recovered_file(conversation_id, message_id, record, download)
+        return download
 
 
 def remove_generated_file_bytes(files: list[dict[str, Any]]) -> None:
@@ -874,6 +892,7 @@ def branch_conversation(
         )
         attachment_map[attachment_id] = copied["id"]
 
+    copied_downloads = {}
     for message in source_messages:
         metadata = dict(message.get("metadata", {}))
         if "attachment_ids" in metadata:
@@ -884,7 +903,10 @@ def branch_conversation(
             ]
         copied_generated_files: list[dict[str, Any]] = []
         copied_paths: list[Path] = []
-        metadata.pop("generated_files", None)
+        source_downloads = {
+            item["id"]: item for item in metadata.pop("generated_files", [])
+            if "id" in item
+        }
 
         for source_file in db.list_message_generated_files(message["id"]):
             source_path = GENERATED_DIR / source_file["stored_name"]
@@ -904,20 +926,24 @@ def branch_conversation(
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_path, destination)
             copied_paths.append(destination)
+            copied_downloads[source_file["id"]] = {**source_file, "id": copied_id, "stored_name": copied_stored_name}
             copied_generated_files.append(
                 {
                     **source_file,
+                    "sandbox_path": source_file.get("sandbox_path") or source_downloads.get(source_file["id"], {}).get("sandbox_path"),
                     "id": copied_id,
                     "stored_name": copied_stored_name,
                     "created_at": source_file["created_at"],
                 }
             )
 
-        if copied_generated_files:
-            metadata["generated_files"] = [
-                generated_file_metadata(branch["id"], file_row)
-                for file_row in copied_generated_files
-            ]
+        references = {row["id"]: row for row in copied_generated_files}
+        for source_id in source_downloads:
+            if source_id in copied_downloads:
+                row = copied_downloads[source_id]
+                references[row["id"]] = row
+        if references:
+            metadata["generated_files"] = [generated_file_metadata(branch["id"], row) for row in references.values()]
 
         try:
             db.add_message(
@@ -1043,11 +1069,12 @@ def _finish_cancelled_generation(
 ) -> None:
     duration_seconds = round(time.monotonic() - started_monotonic, 1)
     assistant_message = None
-    if assistant_text.strip():
+    records = db.list_message_generated_files(job.user_message["id"])
+    if assistant_text.strip() or reasoning_summary or records:
         assistant_message = db.add_message(
             job.conversation_id,
             "assistant",
-            assistant_text,
+            assistant_text or "Generation stopped. Saved work is available below.",
             {
                 "endpoint_id": endpoint.id,
                 "model_id": model.id,
@@ -1057,7 +1084,11 @@ def _finish_cancelled_generation(
                 "web_search_enabled": payload.use_web_search,
                 "research_depth": payload.research_depth,
                 "stopped": True,
+                "generated_files": [generated_file_metadata(job.conversation_id, f) for f in records],
+                "diagnostics_url": f"/api/generations/{job.id}/diagnostics",
             },
+            generated_files=records,
+            message_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"foundry-chat/{job.id}")),
         )
 
     db.clear_response_link(job.conversation_id)
@@ -1091,14 +1122,47 @@ def _run_generation_job(
     attachments: list[dict[str, Any]],
     project_files: list[dict[str, Any]],
     retained_generated_files: list[dict[str, Any]],
+    resume_state: dict[str, Any] | None = None,
 ) -> None:
     started_monotonic = time.monotonic()
     started_at = time.time()
-    reasoning_summary = ""
-    assistant_text = ""
-    activities: list[str] = []
+    reasoning_summary = job.reasoning_summary
+    assistant_text = job.assistant_text
+    activities: list[str] = list(job.activities)
     final_response: Any | None = None
+    completed_output_items: list[dict[str, Any]] = []
     provider_stream: Any | None = None
+    diagnostics: dict[str, Any] = {
+        "generation_id": job.id,
+        "started_at": started_at,
+        "endpoint_id": endpoint.id,
+        "model_id": model.id,
+        "deployment": model.deployment,
+        "reasoning_effort": payload.reasoning_effort,
+        "verbosity": payload.verbosity,
+        "max_output_tokens": payload.max_output_tokens,
+        "code_interpreter": payload.use_code_interpreter,
+        "web_search": payload.use_web_search,
+    }
+    if resume_state:
+        diagnostics.update(resume_state.get("diagnostics", {}))
+        started_at = diagnostics.get("started_at", started_at)
+        started_monotonic -= max(0, time.time() - started_at)
+    file_errors = []
+    capture_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="file-capture")
+    capture_futures = {}
+    diagnostics_lock = threading.RLock()
+
+    def save_diagnostics(update: dict[str, Any]) -> None:
+        with diagnostics_lock:
+            diagnostics.update(update)
+            diagnostics["elapsed_seconds"] = round(time.monotonic() - started_monotonic, 1)
+            try:
+                db.update_generation_job(job.id, diagnostics=diagnostics)
+            except Exception:
+                logger.warning("Could not save diagnostics for generation %s", job.id, exc_info=True)
+
+    diagnostics_url = f"/api/generations/{job.id}/diagnostics"
 
     def activity(label: str) -> None:
         if label in activities:
@@ -1107,6 +1171,7 @@ def _run_generation_job(
         job.publish({"type": "activity", "label": label})
 
     try:
+        save_diagnostics({"app_status": "running"})
         db.update_generation_job(
             job.id,
             status="running",
@@ -1146,59 +1211,92 @@ def _run_generation_job(
                 }
             )
 
-        provider_file_ids, named_provider_files = prepare_provider_files(
-            endpoint,
-            attachments,
-            project_files,
-            retained_generated_files,
-        )
-        input_payload, previous_response_id = build_input_payload(
-            conversation=conversation,
-            payload=payload,
-            named_provider_files=named_provider_files,
-        )
+        if resume_state:
+            provider_stream = ResumableResponseStream.resume_existing(
+                make_client(endpoint), resume_state["diagnostics"]["response_id"],
+                on_diagnostics=save_diagnostics, diagnostics=resume_state.get("diagnostics"),
+            )
+        else:
+            provider_file_ids, named_provider_files = prepare_provider_files(
+                endpoint,
+                attachments,
+                project_files,
+                retained_generated_files,
+            )
+            save_diagnostics({
+                "code_interpreter": payload.use_code_interpreter or bool(provider_file_ids),
+                "files": {
+                    "source_count": len(attachments) + len(project_files) + len(retained_generated_files),
+                    "provider_count": len(provider_file_ids),
+                    "bundles": sum(bool(row.get("bundle_count")) for row, _ in named_provider_files),
+                },
+            })
+            input_payload, previous_response_id = build_input_payload(
+                conversation=conversation,
+                payload=payload,
+                named_provider_files=named_provider_files,
+            )
 
-        if job.cancel_event.is_set():
-            _finish_cancelled_generation(
-                job=job,
+            if job.cancel_event.is_set():
+                _finish_cancelled_generation(
+                    job=job,
+                    endpoint=endpoint,
+                    model=model,
+                    payload=payload,
+                    assistant_text=assistant_text,
+                    reasoning_summary=reasoning_summary,
+                    activities=activities,
+                    started_monotonic=started_monotonic,
+                )
+                return
+
+            db.update_generation_job(job.id, status_label="Thinking")
+            job.publish({"type": "status", "label": "Thinking"})
+
+            provider_stream = stream_response(
                 endpoint=endpoint,
                 model=model,
-                payload=payload,
-                assistant_text=assistant_text,
-                reasoning_summary=reasoning_summary,
-                activities=activities,
-                started_monotonic=started_monotonic,
+                input_payload=input_payload,
+                instructions=combined_instructions(conversation, payload),
+                reasoning_effort=payload.reasoning_effort,
+                verbosity=payload.verbosity,
+                max_output_tokens=payload.max_output_tokens,
+                use_code_interpreter=(
+                    payload.use_code_interpreter or bool(provider_file_ids)
+                ),
+                provider_file_ids=provider_file_ids,
+                use_web_search=payload.use_web_search,
+                research_depth=payload.research_depth,
+                web_allowed_domains=payload.web_allowed_domains,
+                web_blocked_domains=payload.web_blocked_domains,
+                previous_response_id=previous_response_id,
+                on_diagnostics=save_diagnostics,
             )
-            return
-
-        db.update_generation_job(job.id, status_label="Thinking")
-        job.publish({"type": "status", "label": "Thinking"})
-
-        provider_stream = stream_response(
-            endpoint=endpoint,
-            model=model,
-            input_payload=input_payload,
-            instructions=combined_instructions(conversation, payload),
-            reasoning_effort=payload.reasoning_effort,
-            verbosity=payload.verbosity,
-            max_output_tokens=payload.max_output_tokens,
-            use_code_interpreter=(
-                payload.use_code_interpreter or bool(provider_file_ids)
-            ),
-            provider_file_ids=provider_file_ids,
-            use_web_search=payload.use_web_search,
-            research_depth=payload.research_depth,
-            web_allowed_domains=payload.web_allowed_domains,
-            web_blocked_domains=payload.web_blocked_domains,
-            previous_response_id=previous_response_id,
+        job.provider_stream = provider_stream
+        job.set_cancel_callback(
+            getattr(provider_stream, "cancel", None) or getattr(provider_stream, "close", None)
         )
-        job.set_cancel_callback(getattr(provider_stream, "close", None))
 
         for event in provider_stream:
+            if _shutting_down.is_set():
+                return
             if job.cancel_event.is_set():
                 break
 
             event_type = str(getattr(event, "type", ""))
+
+            if event_type == "app.snapshot":
+                saved = getattr(event, "response", None)
+                text = field(saved, "output_text", "") or ""
+                if text and text != assistant_text:
+                    assistant_text = text
+                    job.publish({"type": "output_snapshot", "text": text})
+                continue
+
+            if event_type == "app.status":
+                label = str(getattr(event, "label", "Checking Azure response"))
+                job.publish({"type": "status", "label": label})
+                continue
 
             if event_type in {
                 "response.reasoning_summary_text.delta",
@@ -1250,6 +1348,17 @@ def _run_generation_job(
                     item_raw = item.model_dump() if item is not None else {}
                 except Exception:
                     item_raw = {}
+                if item_raw:
+                    completed_output_items.append(item_raw)
+                    containers = artifacts.references(item_raw)[0]
+                    db.remember_containers(job.conversation_id, endpoint.id, containers)
+                    if item_raw.get("type") == "code_interpreter_call":
+                        container_key = tuple(containers)
+                        pending = capture_futures.get(container_key)
+                        if pending is None or pending.done():
+                            capture_futures[container_key] = capture_pool.submit(
+                                capture_code_files, endpoint, item_raw,
+                                job.conversation_id, job.user_message["id"], file_errors)
                 if item_raw.get("type") == "web_search_call":
                     action = item_raw.get("action") or {}
                     action_type = action.get("type")
@@ -1268,17 +1377,14 @@ def _run_generation_job(
                     job.publish({"type": "output_delta", "delta": delta})
                 continue
 
-            if event_type == "response.completed":
+            if event_type in {"response.completed", "response.failed", "response.incomplete", "response.cancelled"}:
                 final_response = getattr(event, "response", None)
-                continue
+                break
 
-            if event_type in {
-                "error",
-                "response.failed",
-                "response.incomplete",
-            }:
+            if event_type == "error":
                 raise RuntimeError(stream_event_error(event))
 
+        capture_pool.shutdown(wait=True)
         if job.cancel_event.is_set():
             _finish_cancelled_generation(
                 job=job,
@@ -1292,20 +1398,27 @@ def _run_generation_job(
             )
             return
 
+        if _shutting_down.is_set():
+            return
         if final_response is None:
             raise RuntimeError(
                 "The stream ended without a completed response event"
             )
 
+        # A recovered terminal object may contain text missed by the broken
+        # stream. Its output is authoritative, including any continuations.
+        assistant_text = getattr(final_response, "output_text", None) or assistant_text
+        provider_status = field(final_response, "status", "completed")
+        save_diagnostics({"terminal_response": response_details(final_response)})
+        if provider_status != "completed":
+            raise RuntimeError(failure_message(final_response))
         if not assistant_text:
-            assistant_text = (
-                getattr(final_response, "output_text", None)
-                or "(The model returned no text.)"
-            )
+            assistant_text = "(The model returned no text.)"
 
         retained_records, downloads = persist_generated_files(
-            endpoint, final_response, job.conversation_id
+            endpoint, final_response, job.conversation_id, owner_id=job.user_message["id"], errors=file_errors
         )
+        retained_records, downloads = finish_file_capture(job, retained_records, downloads)
         web_research = extract_web_research(final_response)
         for label in web_activity_labels(web_research):
             if label not in activities:
@@ -1323,17 +1436,22 @@ def _run_generation_job(
                     "model_id": model.id,
                     "response_id": response_id,
                     "generated_files": downloads,
+                    "file_errors": file_errors,
                     "reasoning_summary": reasoning_summary,
                     "activities": activities,
                     "duration_seconds": duration_seconds,
                     "web_research": web_research,
                     "web_search_enabled": payload.use_web_search,
                     "research_depth": payload.research_depth,
+                    "diagnostics_url": diagnostics_url,
+                    "provider_status": provider_status,
+                    "usage": diagnostics.get("usage"),
                 },
                 generated_files=retained_records,
+                message_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"foundry-chat/{job.id}")),
             )
         except Exception:
-            remove_generated_file_bytes(retained_records)
+            # Files already checkpointed to the request must survive a DB retry.
             raise
 
         db.update_conversation(
@@ -1345,6 +1463,7 @@ def _run_generation_job(
             previous_model_id=model.id,
         )
         completed_at = time.time()
+        save_diagnostics({"app_status": "completed", "completed_at": completed_at})
         db.update_generation_job(
             job.id,
             assistant_message_id=assistant_message["id"],
@@ -1364,6 +1483,9 @@ def _run_generation_job(
             }
         )
     except Exception as exc:
+        if _shutting_down.is_set():
+            return
+        capture_pool.shutdown(wait=True)
         if job.cancel_event.is_set():
             try:
                 _finish_cancelled_generation(
@@ -1380,14 +1502,65 @@ def _run_generation_job(
                 logger.exception("Could not finalize cancelled generation")
             return
 
-        logger.exception("Background provider request failed")
+        snapshot = final_response or getattr(provider_stream, "last_response", None)
+        if snapshot is not None:
+            saved_text = getattr(snapshot, "output_text", None) or ""
+            if len(saved_text) > len(assistant_text):
+                assistant_text = saved_text
+        provider_status = field(snapshot, "status", "unknown")
+        failure = error_details(exc)
+        if provider_status == "failed":
+            failure = error_details(snapshot)
+        save_diagnostics({
+            "app_status": "failed", "completed_at": time.time(),
+            "failure": failure,
+            "terminal_response": response_details(snapshot) if snapshot is not None else None,
+        })
+        logger.error("Generation %s failed, response=%s status=%s code=%s request=%s",
+                     job.id, diagnostics.get("response_id"), provider_status,
+                     failure.get("code"), failure.get("request_id"))
+        retained_records, downloads = [], []
+        if snapshot is not None or completed_output_items:
+            try:
+                final_output = snapshot.model_dump().get("output", []) if snapshot is not None else []
+                file_snapshot = SimpleNamespace(model_dump=lambda: {"output": completed_output_items + final_output})
+                retained_records, downloads = persist_generated_files(endpoint, file_snapshot, job.conversation_id, owner_id=job.user_message["id"], errors=file_errors)
+            except Exception as file_exc:
+                save_diagnostics({"file_retention_error": error_details(file_exc)})
+
+        retained_records, downloads = finish_file_capture(job, retained_records, downloads)
+        notice = f"Request failed: {exc}"
+        if provider_status == "incomplete":
+            notice = failure_message(snapshot)
+        elif provider_status in {"queued", "in_progress", "unknown"}:
+            notice += " The Azure outcome is unconfirmed; a new generation was not submitted automatically."
+        response_id = field(snapshot, "id") or diagnostics.get("response_id")
+        if response_id:
+            notice += f"\n\nAzure response ID: `{response_id}`."
+        notice += "\n\nUse Request diagnostics below for request IDs, timing, and reported token usage."
+        content = f"{assistant_text}\n\n---\n\n{notice}" if assistant_text else notice
         error_message = db.add_message(
             job.conversation_id,
             "assistant",
-            f"Request failed: {exc}",
-            {"error": True},
+            content,
+            {
+                "error": True, "provider_status": provider_status,
+                "file_errors": file_errors,
+                "partial_output": assistant_text,
+                "response_id": response_id,
+                "reasoning_summary": reasoning_summary, "activities": activities,
+                "duration_seconds": round(time.monotonic() - started_monotonic, 1),
+                "generated_files": downloads, "diagnostics_url": diagnostics_url,
+                "usage": diagnostics.get("usage"),
+            },
+            generated_files=retained_records,
+            message_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"foundry-chat/{job.id}")),
         )
-        db.clear_response_link(job.conversation_id)
+        if provider_status == "incomplete" and response_id:
+            db.update_conversation(job.conversation_id, previous_response_id=response_id,
+                                   previous_endpoint_id=endpoint.id, previous_model_id=model.id)
+        else:
+            db.clear_response_link(job.conversation_id)
         completed_at = time.time()
         db.update_generation_job(
             job.id,
@@ -1406,9 +1579,13 @@ def _run_generation_job(
             }
         )
     finally:
+        capture_pool.shutdown(wait=True)
+        job.checkpoint(force=True)
+        if job.cancel_event.is_set():
+            save_diagnostics({"app_status": "cancelled", "completed_at": time.time()})
         job.set_cancel_callback(None)
         if provider_stream is not None:
-            close = getattr(provider_stream, "close", None)
+            close = getattr(provider_stream, "dispose", None) or getattr(provider_stream, "close", None)
             if callable(close):
                 try:
                     close()
@@ -1418,6 +1595,40 @@ def _run_generation_job(
         with _generation_lock:
             if _active_generation_by_conversation.get(job.conversation_id) == job.id:
                 _active_generation_by_conversation.pop(job.conversation_id, None)
+
+
+def restore_generations():
+    for row in db.list_active_generation_jobs():
+        if row["id"] in _generations:
+            continue
+        try:
+            saved = row.get("request", {})
+            endpoint_id = saved.get("endpoint_id") or row.get("diagnostics", {}).get("endpoint_id")
+            endpoint = config.endpoints[endpoint_id]
+            model = endpoint.models[saved.get("model_id") or row["diagnostics"]["model_id"]]
+            if not row.get("diagnostics", {}).get("response_id") or not row.get("user_message_id"):
+                raise ValueError("No saved Azure response ID")
+            payload = MessageCreate(**saved.get("payload", {"content": "Recover saved response"}))
+            job = GenerationJob(row, db.get_message(row["user_message_id"]),
+                on_checkpoint=lambda snapshot, job_id=row["id"]: db.update_generation_job(job_id, snapshot=snapshot))
+            _generations[job.id] = job
+            _active_generation_by_conversation[job.conversation_id] = job.id
+            threading.Thread(target=_run_generation_job, kwargs={
+                "job": job, "conversation": db.get_conversation(job.conversation_id), "payload": payload,
+                "endpoint": endpoint, "model": model, "attachments": [], "project_files": [],
+                "retained_generated_files": [], "resume_state": row,
+            }, daemon=True, name=f"recover-{job.id[:8]}").start()
+        except (KeyError, ValueError):
+            notice = "The application restarted without enough information to reconnect to Azure. No new generation was submitted."
+            snapshot = row.get("snapshot", {})
+            text = snapshot.get("assistant_text", "")
+            records = db.list_message_generated_files(row["user_message_id"]) if row.get("user_message_id") else []
+            assistant = db.add_message(row["conversation_id"], "assistant", (text + "\n\n" if text else "") + notice,
+                {"error": True, "interrupted": True, "reasoning_summary": snapshot.get("reasoning_summary", ""),
+                 "generated_files": [generated_file_metadata(row["conversation_id"], f) for f in records],
+                 "diagnostics_url": f"/api/generations/{row['id']}/diagnostics"}, generated_files=records)
+            db.update_generation_job(row["id"], status="failed", status_label="Interrupted", error=notice,
+                                     assistant_message_id=assistant["id"], completed_at=time.time())
 
 
 def _prune_generation_registry() -> None:
@@ -1471,7 +1682,8 @@ def _start_generation_job(
             )
 
         job_row = db.create_generation_job(conversation_id, user_message["id"])
-        job = GenerationJob(job_row, user_message)
+        db.update_generation_job(job_row["id"], request={"payload": payload.model_dump(), "endpoint_id": endpoint.id, "model_id": model.id})
+        job = GenerationJob(job_row, user_message, on_checkpoint=lambda snapshot: db.update_generation_job(job_row["id"], snapshot=snapshot))
         _generations[job.id] = job
         _active_generation_by_conversation[conversation_id] = job.id
 
@@ -1521,12 +1733,22 @@ def get_generation(generation_id: str) -> dict[str, Any]:
     except KeyError:
         raise HTTPException(status_code=404, detail="Generation not found")
     return {
-        **row,
-        "last_sequence": 0,
-        "assistant_text": "",
-        "reasoning_summary": "",
-        "activities": [],
+        **row.get("snapshot", {}),
+        **{k: v for k, v in row.items() if k not in {"request", "diagnostics", "snapshot"}},
     }
+
+
+@app.get("/api/generations/{generation_id}/diagnostics")
+def download_generation_diagnostics(generation_id: str) -> Response:
+    try:
+        row = db.get_generation_job(generation_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Generation not found")
+    return Response(
+        content=json.dumps(row.get("diagnostics", {}), indent=2, ensure_ascii=False),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="request-{row["id"]}.json"'},
+    )
 
 
 @app.get("/api/generations/{generation_id}/stream")
@@ -1671,7 +1893,7 @@ def generated_file(
 
 if __name__ == "__main__":
     uvicorn.run(
-        "app.main:app",
+        app,
         host=os.getenv("APP_HOST", "127.0.0.1"),
         port=int(os.getenv("APP_PORT", "3000")),
         reload=False,

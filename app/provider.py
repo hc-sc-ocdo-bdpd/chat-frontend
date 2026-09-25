@@ -1,16 +1,19 @@
 from __future__ import annotations
 
-import os
 import tempfile
-import time
 import zipfile
+import logging
+import posixpath
+import re
+from urllib.parse import unquote
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Iterable
 
 import httpx
 
 from .config import EndpointConfig, ModelConfig
+from .file_bundles import MAX_CONTAINER_FILES
+from .response_stream import ResumableResponseStream
 
 # Azure's Responses API has two different file paths:
 #
@@ -140,6 +143,10 @@ def upload_file(
             file_path,
             original_name,
         )
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
     return uploaded.id
 
 
@@ -177,6 +184,8 @@ def build_history_input(messages: Iterable[dict[str, Any]]) -> list[dict[str, st
     for message in messages:
         role = message.get("role")
         content = str(message.get("content", ""))
+        if (message.get("metadata") or {}).get("error"):
+            content = str((message.get("metadata") or {}).get("partial_output") or "")
         if role not in {"user", "assistant"} or not content:
             continue
         history.append({"role": role, "content": content})
@@ -209,8 +218,7 @@ def build_web_search_tool(
     allowed_domains: list[str],
     blocked_domains: list[str],
 ) -> dict[str, Any]:
-    # The UI exposes one research mode: thorough. Keep the parameter for
-    # compatibility with older clients, but always use Azure's high-context search.
+    # Web research uses the high-context search setting.
     tool: dict[str, Any] = {
         "type": "web_search",
         "search_context_size": "high",
@@ -267,6 +275,9 @@ def build_response_arguments(
 
     tools: list[dict[str, Any]] = []
     if use_code_interpreter:
+        provider_file_ids = list(dict.fromkeys(provider_file_ids))
+        if len(provider_file_ids) > MAX_CONTAINER_FILES:
+            raise ValueError("Code Interpreter accepts at most 50 file IDs. Bundle the files before submitting.")
         container: dict[str, Any] = {"type": "auto"}
         if provider_file_ids:
             container["file_ids"] = provider_file_ids
@@ -336,239 +347,12 @@ def create_response(
         web_blocked_domains=web_blocked_domains,
         previous_response_id=previous_response_id,
     )
-    return client.responses.create(**arguments)
-
-
-def _positive_int_env(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
     try:
-        value = int(raw)
-    except ValueError:
-        return default
-    return value if value >= 0 else default
-
-
-class CombinedResponse:
-    """Expose multiple chained Responses as one final response to the app."""
-
-    def __init__(self, responses: list[Any], final_response: Any) -> None:
-        self._responses = [*responses, final_response]
-        self._final = final_response
-        self.id = getattr(final_response, "id", "")
-        self.output_text = "".join(
-            str(getattr(response, "output_text", "") or "")
-            for response in self._responses
-        )
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._final, name)
-
-    def model_dump(self) -> dict[str, Any]:
-        final_raw = self._final.model_dump()
-        combined_output: list[Any] = []
-        for response in self._responses:
-            raw = response.model_dump()
-            output = raw.get("output") if isinstance(raw, dict) else None
-            if isinstance(output, list):
-                combined_output.extend(output)
-        final_raw["output"] = combined_output
-        final_raw["id"] = self.id
-        return final_raw
-
-
-class ResumableResponseStream:
-    """Durable Azure Responses stream with transparent reconnects.
-
-    Azure background streams can be resumed from a response ID and event
-    sequence number. This wrapper keeps the existing iterator interface used by
-    main.py while recovering from dropped/chunk-truncated HTTP connections.
-
-    A single GPT-5.6 / GPT-6 Astra response is capped at 128k output tokens. If
-    Azure ends a response with ``max_output_tokens``, transparently chain a
-    continuation response so the UI can receive a longer logical answer.
-    """
-
-    def __init__(self, client: Any, arguments: dict[str, Any]) -> None:
-        self.client = client
-        self.base_arguments = dict(arguments)
-        self.current_stream: Any | None = None
-        self.current_iterator: Any | None = None
-        self.response_id: str | None = None
-        self.sequence_number: int | None = None
-        self.terminal = False
-        self.closed = False
-        self.resume_failures = 0
-        self.continuations = 0
-        self.prior_responses: list[Any] = []
-        self.max_resume_attempts = _positive_int_env(
-            "APP_STREAM_RESUME_ATTEMPTS", 8
-        )
-        self.max_continuations = _positive_int_env(
-            "APP_MAX_AUTO_CONTINUATIONS", 3
-        )
-        self._start(self.base_arguments)
-
-    def __iter__(self) -> "ResumableResponseStream":
-        return self
-
-    def _close_current(self) -> None:
-        if self.current_stream is None:
-            return
-        close = getattr(self.current_stream, "close", None)
+        return client.with_options(max_retries=0).responses.create(**arguments)
+    finally:
+        close = getattr(client, "close", None)
         if callable(close):
-            try:
-                close()
-            except Exception:
-                pass
-        self.current_stream = None
-        self.current_iterator = None
-
-    def _start(self, arguments: dict[str, Any]) -> None:
-        self._close_current()
-        self.current_stream = self.client.responses.create(**arguments)
-        self.current_iterator = iter(self.current_stream)
-        self.response_id = None
-        self.sequence_number = None
-        self.terminal = False
-        self.resume_failures = 0
-
-    def _resume(self) -> None:
-        if not self.response_id:
-            raise RuntimeError("Cannot resume a response before Azure returned an ID")
-        self._close_current()
-        starting_after = self.sequence_number if self.sequence_number is not None else 0
-        self.current_stream = self.client.responses.retrieve(
-            response_id=self.response_id,
-            stream=True,
-            starting_after=starting_after,
-        )
-        self.current_iterator = iter(self.current_stream)
-
-    @staticmethod
-    def _incomplete_reason(response: Any) -> str:
-        details = getattr(response, "incomplete_details", None)
-        return str(getattr(details, "reason", "") or "")
-
-    def _start_continuation(self, previous_response_id: str) -> None:
-        self.continuations += 1
-        arguments = dict(self.base_arguments)
-        arguments["input"] = (
-            "Continue exactly where the previous response stopped. "
-            "Do not repeat material that was already completed. Finish the "
-            "original user request, preserving the same format and level of detail."
-        )
-        arguments["previous_response_id"] = previous_response_id
-        self._start(arguments)
-
-    def _recover(self, error: Exception | None = None) -> bool:
-        if not self.response_id or self.resume_failures >= self.max_resume_attempts:
-            return False
-        self.resume_failures += 1
-        # Short bounded backoff avoids hammering Azure when a proxy or network
-        # path is briefly unhealthy. The background response keeps running.
-        time.sleep(min(0.4 * (2 ** (self.resume_failures - 1)), 5.0))
-        try:
-            self._resume()
-            return True
-        except Exception:
-            if self.resume_failures >= self.max_resume_attempts:
-                if error is not None:
-                    raise error
-                raise
-            return self._recover(error)
-
-    def __next__(self) -> Any:
-        while not self.closed:
-            try:
-                if self.current_iterator is None:
-                    raise StopIteration
-                event = next(self.current_iterator)
-            except StopIteration:
-                if self.terminal:
-                    raise
-                if self._recover():
-                    continue
-                raise RuntimeError(
-                    "The Azure response stream ended before a terminal event "
-                    "and could not be resumed"
-                )
-            except Exception as exc:
-                if self._recover(exc):
-                    continue
-                raise
-
-            event_type = str(getattr(event, "type", ""))
-            sequence_number = getattr(event, "sequence_number", None)
-            if isinstance(sequence_number, int):
-                self.sequence_number = sequence_number
-                self.resume_failures = 0
-
-            response = getattr(event, "response", None)
-            response_id = getattr(response, "id", None)
-            if isinstance(response_id, str) and response_id:
-                self.response_id = response_id
-
-            if event_type == "response.created":
-                self.terminal = False
-                return event
-
-            if event_type == "response.incomplete":
-                reason = self._incomplete_reason(response)
-                if (
-                    reason == "max_output_tokens"
-                    and self.response_id
-                    and self.continuations < self.max_continuations
-                ):
-                    if response is not None:
-                        self.prior_responses.append(response)
-                    self._start_continuation(self.response_id)
-                    continue
-
-                # main.py currently understands response.completed as the
-                # successful terminal event. Preserve all text already streamed
-                # instead of throwing it away when Azure returns a terminal
-                # incomplete response (for example content filtering or after
-                # the configured continuation ceiling).
-                self.terminal = True
-                return SimpleNamespace(
-                    type="response.completed",
-                    response=response,
-                    sequence_number=self.sequence_number,
-                )
-
-            if event_type == "response.completed":
-                self.terminal = True
-                if self.prior_responses and response is not None:
-                    return SimpleNamespace(
-                        type="response.completed",
-                        response=CombinedResponse(self.prior_responses, response),
-                        sequence_number=self.sequence_number,
-                    )
-
-            if event_type == "response.failed":
-                self.terminal = True
-
-            return event
-
-        raise StopIteration
-
-    def close(self) -> None:
-        if self.closed:
-            return
-        self.closed = True
-        self._close_current()
-
-        # Because streamed requests run in background mode, closing the local
-        # stream does not itself stop Azure. Cancel a non-terminal response so a
-        # user pressing Stop, navigating away, or losing the browser connection
-        # does not leave an orphaned billable generation running.
-        if self.response_id and not self.terminal:
-            try:
-                self.client.responses.cancel(self.response_id)
-            except Exception:
-                pass
+            close()
 
 
 def stream_response(
@@ -587,6 +371,7 @@ def stream_response(
     web_allowed_domains: list[str],
     web_blocked_domains: list[str],
     previous_response_id: str | None,
+    on_diagnostics: Any = None,
 ) -> Any:
     client = make_client(endpoint)
     arguments = build_response_arguments(
@@ -605,18 +390,45 @@ def stream_response(
         previous_response_id=previous_response_id,
         stream=True,
     )
-    return ResumableResponseStream(client, arguments)
+    return ResumableResponseStream(client, arguments, on_diagnostics)
 
-def extract_generated_files(response: Any) -> list[dict[str, str]]:
+def _container_path(value: str) -> str:
+    path = unquote(re.sub(r"^sandbox:", "", value.strip(), flags=re.I))
+    path = posixpath.normpath(path)
+    if not path.startswith("/mnt/data/") or any(ord(c) < 32 for c in path):
+        return ""
+    return path
+
+
+def extract_generated_files(
+    response: Any, *, endpoint: EndpointConfig | None = None
+) -> list[dict[str, str]]:
+    """Resolve citations and uncited sandbox links to actual container files."""
     raw = response.model_dump()
     found: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
+    containers: list[str] = []
+    linked_paths: set[str] = set()
 
     def visit(value: Any) -> None:
         if isinstance(value, dict):
             item_type = value.get("type")
             file_id = value.get("file_id")
             container_id = value.get("container_id")
+            if (
+                item_type in {"code_interpreter_call", "container_file_citation"}
+                and isinstance(container_id, str)
+                and container_id not in containers
+            ):
+                containers.append(container_id)
+            if item_type == "output_text" and isinstance(value.get("text"), str):
+                for match in re.finditer(
+                    r"\[[^\]\n]+\]\\?\((sandbox:/+[^)\n]+?)\\?\)",
+                    value["text"], re.I,
+                ):
+                    path = _container_path(match[1])
+                    if path:
+                        linked_paths.add(path)
             if (
                 item_type == "container_file_citation"
                 and isinstance(file_id, str)
@@ -643,6 +455,59 @@ def extract_generated_files(response: Any) -> list[dict[str, str]]:
                 visit(child)
 
     visit(raw)
+
+    # Most responses have proper citations. Only list files for missing links.
+    # A basename citation is usable when just one linked path has that name.
+    covered: set[str] = set()
+    for source in found:
+        path = _container_path(source["filename"])
+        candidates = {p for p in linked_paths if posixpath.basename(p) == source["filename"]}
+        if path:
+            source["sandbox_path"] = path
+            covered.add(path)
+        elif len(candidates) == 1:
+            source["sandbox_path"] = next(iter(candidates))
+            covered.update(candidates)
+    missing = linked_paths - covered
+    if endpoint is None or not missing or not containers:
+        return found
+
+    matches: dict[str, dict[tuple[str, str], dict[str, str]]] = {}
+    with make_client(endpoint).with_options(timeout=30.0, max_retries=0) as client:
+        for container_id in containers:
+            try:
+                # SDK iteration follows pagination, including files after page 1.
+                for file in client.containers.files.list(container_id, limit=100):
+                    path = _container_path(file.path)
+                    if path in missing:
+                        key = (container_id, file.id)
+                        matches.setdefault(path, {})[key] = {
+                            "container_id": container_id,
+                            "file_id": file.id,
+                            "filename": posixpath.basename(path),
+                            "sandbox_path": path,
+                        }
+            except Exception:
+                # An expired container must not prevent retaining cited files.
+                logging.getLogger(__name__).warning(
+                    "Could not list generated files in container %s", container_id,
+                    exc_info=True,
+                )
+    for path in sorted(missing):
+        candidates = matches.get(path, {})
+        if len(candidates) != 1:
+            logging.getLogger(__name__).warning(
+                "Sandbox file could not be resolved uniquely: %s", path
+            )
+            continue
+        key, source = next(iter(candidates.items()))
+        if key not in seen:
+            seen.add(key)
+            found.append(source)
+        else:
+            for cited in found:
+                if (cited["container_id"], cited["file_id"]) == key:
+                    cited["sandbox_path"] = path
     return found
 
 
@@ -795,21 +660,8 @@ def download_generated_file(
     container_id: str,
     file_id: str,
 ) -> httpx.Response:
-    client = make_client(endpoint)
-    upstream = client.containers.files.content.retrieve(
-        file_id=file_id,
-        container_id=container_id,
-    )
-    upstream_headers = getattr(upstream, "headers", None)
-    content_type = (
-        upstream_headers.get("content-type")
-        if upstream_headers is not None
-        else None
-    )
-    return httpx.Response(
-        status_code=200,
-        content=upstream.read(),
-        headers={
-            "content-type": content_type or "application/octet-stream"
-        },
-    )
+    with make_client(endpoint).with_options(timeout=60.0, max_retries=0) as client:
+        upstream = client.containers.files.content.retrieve(file_id=file_id, container_id=container_id)
+        headers = getattr(upstream, "headers", {}) or {}
+        return httpx.Response(200, content=upstream.read(), headers={
+            "content-type": headers.get("content-type", "application/octet-stream")})

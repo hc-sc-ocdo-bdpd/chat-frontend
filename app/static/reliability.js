@@ -1,6 +1,4 @@
-// Settings and attachment UX extensions for Foundry Chat.
-// Loaded after app.js so these small overrides can preserve user tool settings
-// and show submitted files without replacing the generation lifecycle.
+// Model settings and submitted attachment display.
 (() => {
   const originalRefreshModelControls = refreshModelControls;
   const originalMessageElement = messageElement;
@@ -13,6 +11,8 @@
       codeInterpreter: Boolean(el.codeInterpreter.checked),
       webSearch: Boolean(el.webSearch.checked),
       maxOutputTokens: el.maxOutputTokens.value,
+      reasoning: el.reasoning.value,
+      verbosity: el.verbosity.value,
     };
   }
 
@@ -38,6 +38,9 @@
     if (desiredSettings.maxOutputTokens) {
       el.maxOutputTokens.value = desiredSettings.maxOutputTokens;
     }
+    for (const [control, value] of [[el.reasoning, desiredSettings.reasoning], [el.verbosity, desiredSettings.verbosity]]) {
+      if (Array.from(control.options).some((option) => option.value === value)) control.value = value;
+    }
     updateToolControls();
   }
 
@@ -59,6 +62,8 @@
   el.codeInterpreter.addEventListener("change", rememberDesiredSettings);
   el.webSearch.addEventListener("change", rememberDesiredSettings);
   el.maxOutputTokens.addEventListener("input", rememberDesiredSettings);
+  el.reasoning.addEventListener("change", rememberDesiredSettings);
+  el.verbosity.addEventListener("change", rememberDesiredSettings);
 
   function findAttachment(attachmentId) {
     const conversationAttachments =

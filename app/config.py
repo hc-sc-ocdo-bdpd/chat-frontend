@@ -111,8 +111,7 @@ def _discover_deployments(environment: Mapping[str, str]) -> list[tuple[int, str
 
     discovered.sort(key=lambda item: item[0])
 
-    # Backward compatibility for existing local installations. New setups and
-    # the public .env.example use the numbered convention only.
+    # A single deployment may use the unnumbered environment variable.
     if not discovered:
         legacy = str(environment.get("AZURE_OPENAI_DEPLOYMENT", "")).strip()
         if legacy:
@@ -275,7 +274,7 @@ def load_config(
 
     default_model = next(iter(model_map))
     return AppConfig(
-        title=str(app_raw.get("title", "Foundry Chat")),
+        title=str(app_raw.get("title", "Chat")),
         default_endpoint=endpoint.id,
         default_model=default_model,
         default_instructions=str(app_raw.get("default_instructions", "")),

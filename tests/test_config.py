@@ -57,7 +57,7 @@ def test_config_discovers_multiple_models(monkeypatch: pytest.MonkeyPatch) -> No
     assert endpoint.models["test-mini"].label == "test-mini"
     assert endpoint.models["test-sol"].supports_code_interpreter is True
     assert endpoint.models["test-sol"].supports_web_search is True
-    assert endpoint.models["test-sol"].default_web_search is False
+    assert endpoint.models["test-sol"].default_web_search is True  # Checked-in default
     assert endpoint.models["test-sol"].default_research_depth == "thorough"
     assert "high" in endpoint.models["test-sol"].reasoning_efforts
 

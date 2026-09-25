@@ -70,7 +70,7 @@ def ensure_environment_file() -> bool:
 def requirements_hash() -> str:
     digest = hashlib.sha256()
     digest.update(REQUIREMENTS_FILE.read_bytes())
-    digest.update(b"foundry-chat-local-launcher-v2")
+    digest.update(b"chat-local-launcher")
     return digest.hexdigest()
 
 
@@ -126,7 +126,7 @@ def main() -> int:
     )
 
     print()
-    print("Starting Foundry Chat at http://localhost:3000")
+    print("Starting Chat at http://localhost:3000")
     print("Press Ctrl+C to stop.")
     print()
 

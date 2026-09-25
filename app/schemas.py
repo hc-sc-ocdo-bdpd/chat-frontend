@@ -8,8 +8,7 @@ from pydantic import BaseModel, Field
 class ConversationCreate(BaseModel):
     model_id: str | None = None
     project_id: str | None = None
-    # Accepted for backward compatibility with older clients. The app now uses
-    # one shared Azure connection and ignores any client-supplied endpoint.
+    # The server selects the shared connection; client-supplied endpoints are ignored.
     endpoint_id: str | None = None
 
 
@@ -44,8 +43,7 @@ class MessageCreate(BaseModel):
     endpoint_id: str | None = None
     reasoning_effort: str = "auto"
     verbosity: str = "medium"
-    # GPT-5.6 and GPT-6 Astra currently cap a single response at 128k output
-    # tokens. Long answers are automatically chained by the provider layer.
+    # Per-request budget. Automatic paid continuations are disabled by default.
     max_output_tokens: int = Field(default=16384, ge=256, le=128000)
     use_code_interpreter: bool = True
     use_web_search: bool = True
@@ -64,3 +62,7 @@ class PartialAssistantCreate(BaseModel):
     reasoning_summary: str = ""
     activities: list[str] = Field(default_factory=list)
     duration_seconds: float | None = Field(default=None, ge=0)
+
+
+class FileRecover(BaseModel):
+    sandbox_path: str = Field(min_length=1, max_length=4096)

@@ -157,6 +157,8 @@ const ACTIVE_GENERATION_STATUSES = new Set(["queued", "running", "cancelling"]);
 
 function registerGeneration(snapshot) {
   const existing = state.generations.get(snapshot.id);
+  if (existing && Number(snapshot.last_sequence || 0) < Number(existing.lastSequence || 0)) return existing;
+  if (existing && !ACTIVE_GENERATION_STATUSES.has(existing.status) && ACTIVE_GENERATION_STATUSES.has(snapshot.status)) return existing;
   const generation = existing || { id: snapshot.id };
   const snapshotAnswer = snapshot.assistant_text;
   const existingAnswer = generation.assistantText || "";
@@ -507,7 +509,7 @@ function renderEmpty() {
 
   el.messages.innerHTML = `
     <div class="welcome">
-      <h1>${escapeHtml(project?.name || state.catalog?.title || "Foundry Chat")}</h1>
+      <h1>${escapeHtml(project?.name || state.catalog?.title || "Chat")}</h1>
       <p>${
         project
           ? "Start a chat using this project's instructions and persistent files."
@@ -570,7 +572,7 @@ function normalizedBasename(value) {
   } catch (_) {}
 
   const normalized = decoded.replace(/\\/g, "/");
-  return normalized.split("/").filter(Boolean).pop()?.toLowerCase() || "";
+  return normalized.split("/").filter(Boolean).pop() || "";
 }
 
 function resolveMarkdownLink(target, generatedFiles) {
@@ -578,11 +580,24 @@ function resolveMarkdownLink(target, generatedFiles) {
 
   if (/^sandbox:\/+/i.test(trimmed)) {
     const targetName = normalizedBasename(trimmed);
-    const generated = generatedFiles.find(
+    let path = trimmed.replace(/^sandbox:/i, "");
+    try { path = decodeURIComponent(path); } catch (_) {}
+    const parts = [];
+    path.split("/").forEach((part) => {
+      if (part === "..") parts.pop();
+      else if (part && part !== ".") parts.push(part);
+    });
+    path = "/" + parts.join("/");
+    const exact = generatedFiles.filter((file) => file.sandbox_path === path);
+    const legacy = generatedFiles.filter(
       (file) => normalizedBasename(file.filename) === targetName
     );
+    const candidates = exact.length ? exact
+      : legacy.length === 1 && !legacy[0].sandbox_path ? legacy : [];
+    const generated = candidates.length === 1 ? candidates[0] : null;
 
-    if (!generated) return null;
+    if (!generated) return { href: "#", isDownload: true,
+      filename: targetName, sandboxPath: trimmed };
 
     return {
       href: generated.url,
@@ -650,7 +665,7 @@ function appendInlineMarkdown(
   if (!text) return;
 
   const tokenPattern =
-    /(\\\([^\n]*?\\\)|\$\$[^\n]*?\$\$|\\\[[^\n]*?\\\]|\$[^$\n]+?\$|`[^`\n]+`|\[([^\]\n]+)\]\(([^)\n]+)\)|\*\*([^*\n]+)\*\*|\*([^*\n]+)\*)/g;
+    /(\\\([^\n]*?\\\)|\$\$[^\n]*?\$\$|\\\[[^\n]*?\\\]|\$[^$\n]+?\$|`[^`\n]+`|\[([^\]\n]+)\](?:\(|\\\((?=sandbox:))([^)\n]+?)\\?\)|\*\*([^*\n]+)\*\*|\*([^*\n]+)\*)/gi;
 
   let cursor = 0;
   let match;
@@ -684,6 +699,10 @@ function appendInlineMarkdown(
             ? "message-link message-citation-link"
             : "message-link";
         link.href = resolved.href;
+        if (resolved.sandboxPath) {
+          link.dataset.sandboxPath = resolved.sandboxPath;
+          link.title = "Retrieve this file from the chat's saved Azure responses";
+        }
 
         if (resolved.isDownload) {
           link.download = resolved.filename || "";
@@ -1147,6 +1166,7 @@ function scheduleStreamingAnswerRender(streaming) {
   streaming.renderQueued = true;
   requestAnimationFrame(() => {
     streaming.renderQueued = false;
+    if (!streaming.row.isConnected) return;
     clearMathTypeset(streaming.content);
     streaming.content.innerHTML = "";
     renderCodeAwareContent(streaming.content, streaming.answerText, []);
@@ -1169,6 +1189,7 @@ function appendStreamingReasoning(streaming, delta) {
 }
 
 function setStreamingReasoning(streaming, text) {
+  if (streaming.panel.summary.textContent === (text || "")) return;
   streaming.reasoningText = text || "";
   streaming.panel.summary.textContent = streaming.reasoningText;
   streaming.panel.summary.classList.toggle("hidden", !streaming.reasoningText);
@@ -1240,6 +1261,7 @@ function updateGenerationView(generation) {
   const streaming = generation.view;
   if (!streaming) return;
 
+  const answerChanged = streaming.answerText !== (generation.assistantText || "");
   streaming.answerText = generation.assistantText || "";
   setStreamingReasoning(streaming, generation.reasoningText || "");
   Array.from(generation.activities || []).forEach((label) =>
@@ -1249,7 +1271,7 @@ function updateGenerationView(generation) {
     streaming,
     generation.status_label || generation.statusLabel || "Thinking"
   );
-  scheduleStreamingAnswerRender(streaming);
+  if (answerChanged) scheduleStreamingAnswerRender(streaming);
 }
 
 
@@ -1375,6 +1397,7 @@ function messageElement(message, temporary = false) {
   const row = document.createElement("div");
   row.className = `message-row ${message.role}`;
   row.dataset.messageId = message.id || "";
+  row.dataset.conversationId = message.conversation_id || state.activeConversationId || "";
   if (message.metadata?.error) row.classList.add("error");
   if (message.metadata?.stopped) row.classList.add("stopped");
   if (temporary) row.dataset.temporary = "true";
@@ -1405,6 +1428,21 @@ function messageElement(message, temporary = false) {
     stopped.className = "stopped-label";
     stopped.textContent = "Generation stopped";
     inner.appendChild(stopped);
+  }
+
+  if (message.metadata?.file_errors?.length) {
+    const warning = document.createElement("p");
+    warning.className = "file-recovery-status";
+    warning.textContent = "Some files could not be saved. Click their download links to try recovery.";
+    inner.appendChild(warning);
+  }
+  if (message.metadata?.diagnostics_url) {
+    const diagnostics = document.createElement("a");
+    diagnostics.className = "message-action";
+    diagnostics.href = message.metadata.diagnostics_url;
+    diagnostics.textContent = "Request diagnostics";
+    diagnostics.download = "";
+    inner.appendChild(diagnostics);
   }
 
   if (generated.length) {
@@ -1468,21 +1506,93 @@ function messageElement(message, temporary = false) {
   return row;
 }
 
+// Following the newest output is an explicit viewport state, not a side effect
+// of a status refresh. Preserve it across re-renders and conversation switches.
+let followLatest = true;
+let viewportRestoring = false;
+let viewportFrame = 0;
+let openConversationRequest = 0;
+const conversationScroll = new Map();
+const jumpLatest = document.createElement("button");
+jumpLatest.type = "button";
+jumpLatest.className = "jump-latest hidden";
+jumpLatest.textContent = "↓ Jump to latest";
+el.messages.after(jumpLatest);
+function updateJumpLatest() {
+  jumpLatest.classList.toggle("hidden", followLatest);
+}
+jumpLatest.addEventListener("click", () => {
+  followLatest = true;
+  updateJumpLatest();
+  scrollToBottom();
+});
+el.messages.addEventListener("wheel", (event) => {
+  if (event.deltaY < 0) { followLatest = false; updateJumpLatest(); }
+}, { passive: true });
+el.messages.addEventListener("scroll", () => {
+  if (viewportRestoring) return;
+  followLatest = el.messages.scrollHeight - el.messages.clientHeight - el.messages.scrollTop < 48;
+  updateJumpLatest();
+}, { passive: true });
+el.messages.addEventListener("click", async (event) => {
+  const link = event.target.closest("a[data-sandbox-path]");
+  if (!link) return;
+  event.preventDefault();
+  if (link.dataset.recovering) return;
+  const row = link.closest(".message-row");
+  if (!row?.dataset.messageId) {
+    showToast("This file can be retrieved once the response has been saved.");
+    return;
+  }
+  const status = document.createElement("span");
+  status.className = "file-recovery-status";
+  status.setAttribute("role", "status");
+  status.textContent = " Retrieving file…";
+  link.after(status);
+  link.dataset.recovering = "true";
+  try {
+    const result = await api(`/api/conversations/${row.dataset.conversationId}/messages/${row.dataset.messageId}/files/recover`, {
+      method: "POST", body: JSON.stringify({ sandbox_path: link.dataset.sandboxPath }),
+    });
+    link.href = result.url;
+    link.download = result.filename;
+    delete link.dataset.sandboxPath;
+    status.textContent = " Saved. Downloading…";
+    link.click();
+  } catch (error) {
+    status.textContent = ` ${error.message} Click the link to retry.`;
+  } finally {
+    delete link.dataset.recovering;
+  }
+});
+
 function renderMessages(messages) {
+  const top = el.messages.scrollTop;
+  viewportRestoring = true;
   detachGenerationViews();
   clearMathTypeset(el.messages);
   el.messages.innerHTML = "";
-  if (!messages.length) {
-    renderEmpty();
-    return;
-  }
-  messages.forEach((message) => el.messages.appendChild(messageElement(message)));
-  scrollToBottom();
+  if (!messages.length) renderEmpty();
+  else messages.forEach((message) => el.messages.appendChild(messageElement(message)));
+  el.messages.scrollTop = followLatest ? el.messages.scrollHeight : top;
+  cancelAnimationFrame(viewportFrame);
+  const conversationId = state.activeConversationId;
+  viewportFrame = requestAnimationFrame(() => {
+    if (conversationId === state.activeConversationId) {
+      el.messages.scrollTop = followLatest ? el.messages.scrollHeight : top;
+    }
+    viewportRestoring = false;
+    updateJumpLatest();
+  });
 }
 
 function scrollToBottom() {
+  if (!followLatest) return;
+  const conversationId = state.activeConversationId;
   requestAnimationFrame(() => {
-    el.messages.scrollTop = el.messages.scrollHeight;
+    if (followLatest && conversationId === state.activeConversationId) {
+      el.messages.scrollTop = el.messages.scrollHeight;
+    }
   });
 }
 
@@ -1552,6 +1662,15 @@ function renderProjectContext() {
 }
 
 function applyGenerationEvent(generation, event) {
+  if (event.type === "snapshot") {
+    const saved = event.snapshot;
+    Object.assign(generation, saved, { lastSequence: Number(saved.last_sequence || 0),
+      assistantText: saved.assistant_text || "", reasoningText: saved.reasoning_summary || "",
+      activities: new Set(saved.activities || []) });
+    updateGenerationView(generation);
+    return;
+  }
+  if (Number(event.sequence || 0) > 0 && Number(event.sequence) <= (generation.lastSequence || 0)) return;
   generation.lastSequence = Math.max(
     generation.lastSequence || 0,
     Number(event.sequence || 0)
@@ -1591,6 +1710,9 @@ function applyGenerationEvent(generation, event) {
       generation.status_label = event.label || generation.status_label;
       break;
 
+    case "output_snapshot":
+      generation.assistantText = event.text || "";
+      break;
     case "output_delta":
       generation.assistantText += event.delta || "";
       generation.status_label = "Writing response";
@@ -1630,14 +1752,10 @@ function applyGenerationEvent(generation, event) {
 }
 
 async function finalizeGeneration(generation) {
-  if (generation.finalized) return;
-  generation.finalized = true;
+  if (generation.finalized || generation.finalizing) return;
+  generation.finalizing = true;
+  try {
   state.pendingGenerationConversations.delete(generation.conversationId);
-
-  if (generation.view) {
-    finishStreamingAssistant(generation.view);
-    generation.view = null;
-  }
 
   const wasActive = generation.conversationId === state.activeConversationId;
   await loadWorkspace();
@@ -1656,7 +1774,9 @@ async function finalizeGeneration(generation) {
     showToast(generation.error || "A background response failed");
   }
 
+  generation.finalized = true;
   updateComposerState();
+  } finally { generation.finalizing = false; }
 }
 
 async function followGeneration(generation) {
@@ -1696,6 +1816,7 @@ async function followGeneration(generation) {
       }
 
       if (!ACTIVE_GENERATION_STATUSES.has(generation.status)) return;
+      await new Promise((resolve) => setTimeout(resolve, 800));
     }
   })().finally(() => {
     if (state.generationConnections.get(generation.id) === connection) {
@@ -1813,22 +1934,41 @@ async function openConversation(
   id,
   { clearPending = true, markRead = true } = {}
 ) {
+  const request = ++openConversationRequest;
+  const switching = state.activeConversationId !== id;
+  if (switching && state.activeConversationId) {
+    conversationScroll.set(state.activeConversationId, { top: el.messages.scrollTop, follow: followLatest });
+  }
   state.activeConversationId = id;
   setPendingAttachments(state.pendingAttachmentsByConversation.get(id) || [], id);
   updateComposerState();
   const conversation = await api(`/api/conversations/${id}`);
-  if (state.activeConversationId !== id) return;
+  if (state.activeConversationId !== id || request !== openConversationRequest) return;
   state.activeConversation = conversation;
 
   if (markRead) {
     await api(`/api/conversations/${id}/read`, { method: "POST" });
-    if (state.activeConversationId !== id) return;
+    if (state.activeConversationId !== id || request !== openConversationRequest) return;
     const summary = state.conversations.find((item) => item.id === id);
     if (summary) summary.unread = false;
   }
 
   refreshModelSelect(state.activeConversation.model_id);
-  renderMessages(state.activeConversation.messages);
+  if (switching) {
+    const saved = conversationScroll.get(id);
+    followLatest = saved?.follow ?? true;
+    // Render first, then restore the saved position in the new DOM.
+    renderMessages(state.activeConversation.messages);
+    if (saved && !saved.follow) {
+      cancelAnimationFrame(viewportFrame);
+      el.messages.scrollTop = saved.top;
+      viewportFrame = requestAnimationFrame(() => {
+        if (request === openConversationRequest) el.messages.scrollTop = saved.top;
+        viewportRestoring = false;
+        updateJumpLatest();
+      });
+    }
+  } else renderMessages(state.activeConversation.messages);
 
   if (state.activeConversation.generation) {
     const generation = registerGeneration(
@@ -2024,6 +2164,8 @@ async function sendMessageWithContent(
   updateComposerState();
   renderConversations();
 
+  followLatest = true;
+  updateJumpLatest();
   const optimistic = {
     role: "user",
     content: cleaned,
@@ -2469,6 +2611,11 @@ async function refreshConversationStatuses() {
   statusRefreshInFlight = true;
   try {
     await loadConversations();
+    for (const generation of state.generations.values()) {
+      if (!ACTIVE_GENERATION_STATUSES.has(generation.status) && !generation.finalized && !generation.finalizing) {
+        await finalizeGeneration(generation);
+      }
+    }
     const activeSummary = state.conversations.find(
       (item) => item.id === state.activeConversationId
     );
