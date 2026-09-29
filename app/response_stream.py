@@ -16,6 +16,7 @@ from .diagnostics import aggregate_usage, error_details, field, response_details
 
 logger = logging.getLogger("chat.stream")
 TERMINAL_STATUSES = {"completed", "failed", "incomplete", "cancelled"}
+DURABLE_START_MODES = {"auto", "always", "never"}
 
 
 def _nonnegative_env(name: str, default: int) -> int:
@@ -23,6 +24,11 @@ def _nonnegative_env(name: str, default: int) -> int:
         return max(0, int(os.environ.get(name, str(default))))
     except ValueError:
         return default
+
+
+def _choice_env(name: str, default: str, allowed: set[str]) -> str:
+    value = os.environ.get(name, default).strip().lower()
+    return value if value in allowed else default
 
 
 class CombinedResponse:
@@ -47,6 +53,12 @@ class ResumableResponseStream:
 
     A provider-terminal failure stays failed. A new paid response is only
     created for an explicitly configured token-limit continuation.
+
+    Long-running requests can use a durable polling start. Instead of holding
+    the initial POST open waiting for the first SSE event, the app creates a
+    background response without streaming so Azure returns the response ID
+    immediately, then polls that saved response. This closes the pre-ID failure
+    window where an Azure gateway timeout cannot be recovered safely.
     """
 
     def __init__(self, client: Any, arguments: dict[str, Any],
@@ -70,10 +82,19 @@ class ResumableResponseStream:
         self.prior_responses: list[Any] = []
         self.max_resume_attempts = _nonnegative_env("APP_STREAM_RESUME_ATTEMPTS", 8)
         self.max_continuations = _nonnegative_env("APP_MAX_AUTO_CONTINUATIONS", 0)
+        self.durable_start_mode = _choice_env(
+            "APP_DURABLE_START_MODE", "auto", DURABLE_START_MODES
+        )
+        self.durable_start_max_output_tokens = _nonnegative_env(
+            "APP_DURABLE_START_MAX_OUTPUT_TOKENS", 65536
+        )
         self._on_diagnostics = on_diagnostics
         self._diagnostics: dict[str, Any] = {
             "responses": [], "requests": [], "transport_errors": [],
             "continuations": 0, "reconnects": 0, "mode": "stream",
+            "start_mode": None,
+            "durable_start_mode": self.durable_start_mode,
+            "durable_start_max_output_tokens": self.durable_start_max_output_tokens,
             "max_auto_continuations": self.max_continuations,
             "create_retries": 0,
         }
@@ -181,6 +202,93 @@ class ResumableResponseStream:
             self.current_stream = stream
             self.current_iterator = iter(stream)
 
+    def _should_use_durable_start(self, arguments: dict[str, Any]) -> bool:
+        """Choose polling-first background creation for requests most likely to run long."""
+        if not arguments.get("background"):
+            return False
+        if self.durable_start_mode == "always":
+            return True
+        if self.durable_start_mode == "never":
+            return False
+
+        reasoning = arguments.get("reasoning") or {}
+        effort = str(field(reasoning, "effort", "") or "").strip().lower()
+        if effort == "max":
+            return True
+
+        threshold = self.durable_start_max_output_tokens
+        if threshold <= 0:
+            return False
+        try:
+            return int(arguments.get("max_output_tokens") or 0) >= threshold
+        except (TypeError, ValueError):
+            return False
+
+    def _start_streaming(self, arguments: dict[str, Any], client_request_id: str) -> None:
+        self._diagnostics["start_mode"] = "stream"
+        self._diagnostics["mode"] = "stream"
+        self._notify()
+        stream = self._request_client().responses.create(
+            **arguments, extra_headers={"X-Client-Request-Id": client_request_id}
+        )
+        self._record_http(stream, "create", client_request_id)
+        self._attach(stream)
+
+    def _start_durable_polling(self, arguments: dict[str, Any], client_request_id: str) -> None:
+        # Azure documents background non-streaming creation as returning a
+        # response ID immediately. Polling that ID avoids depending on the
+        # first SSE event for recoverability on long-running requests.
+        create_arguments = dict(arguments)
+        create_arguments.pop("stream", None)
+        create_arguments["background"] = True
+        create_arguments["store"] = True
+
+        self._diagnostics["start_mode"] = "durable_background_polling"
+        self._diagnostics["mode"] = "background polling"
+        self._notify()
+        response = self._request_client().responses.create(
+            **create_arguments,
+            extra_headers={"X-Client-Request-Id": client_request_id},
+        )
+        self._record_http(response, "create_background", client_request_id)
+        self._remember(response)
+
+        status = field(response, "status")
+        if status in TERMINAL_STATUSES:
+            self.current_iterator = iter([self._terminal_event(response)])
+            self._polling = False
+        elif status in {"queued", "in_progress"}:
+            # We already have the durable response ID, so attach an SSE stream to
+            # that saved response instead of issuing a blocking status GET. This
+            # preserves live deltas/activity while retaining full recoverability:
+            # if the stream drops, _recover() can resume or poll by response_id.
+            try:
+                self._resume()
+                self._polling = False
+                self._diagnostics["mode"] = "durable background streaming"
+                self._diagnostics["start_mode"] = "durable_background_streaming"
+                self._diagnostics["reconnects"] += 1
+                self._notify()
+            except Exception as exc:
+                self._record_error(exc)
+                if not self._recoverable(exc):
+                    raise
+                # Streaming attachment is an optimization, not a prerequisite.
+                # The response ID is already safe, so fall back to polling the
+                # same job without ever submitting a second generation.
+                self._polling = True
+                self._diagnostics["mode"] = "background polling fallback"
+                self._diagnostics["start_mode"] = "durable_background_polling_fallback"
+                self._notify()
+        else:
+            raise RuntimeError(f"Unexpected Azure response status after background create: {status}")
+
+        # Stop can race with a background create just like it can race with the
+        # first response.created SSE event. Once the ID is known, cancel it.
+        if self._cancel_requested.is_set():
+            self.close()
+            self._cancel_remote()
+
     def _start(self, arguments: dict[str, Any]) -> None:
         self._close_current()
         self.response_id = None
@@ -191,11 +299,10 @@ class ResumableResponseStream:
         self._polling = False
         client_request_id = str(uuid.uuid4())
         self._record_http(None, "create_started", client_request_id)
-        stream = self._request_client().responses.create(
-            **arguments, extra_headers={"X-Client-Request-Id": client_request_id}
-        )
-        self._record_http(stream, "create", client_request_id)
-        self._attach(stream)
+        if self._should_use_durable_start(arguments):
+            self._start_durable_polling(arguments, client_request_id)
+        else:
+            self._start_streaming(arguments, client_request_id)
 
     def _resume(self) -> None:
         arguments: dict[str, Any] = {"response_id": self.response_id, "stream": True}
@@ -380,5 +487,5 @@ class ResumableResponseStream:
         if self.response_id or self._pending_arguments is not None:
             self.close()
             self._cancel_remote()
-        # If creation is in flight, read its first event to learn the ID and
-        # cancel that response. Closing before that event would orphan it.
+        # If creation is in flight, wait for the first provider result to learn
+        # the durable response ID, then cancel that saved response.

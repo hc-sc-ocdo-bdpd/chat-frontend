@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-import tempfile
-import zipfile
+import base64
+import json
 import logging
+import os
 import posixpath
 import re
-from urllib.parse import unquote
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import unquote
 
 import httpx
 
@@ -107,6 +110,114 @@ CONTEXT_STUFFING_EXTENSIONS = {
 }
 
 
+def _positive_mb_env(name: str, default_mb: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, str(default_mb)))) * 1024 * 1024
+    except ValueError:
+        return default_mb * 1024 * 1024
+
+
+# Azure's normal Files API accepts ZIPs for Code Interpreter, but very large
+# multipart/form-data uploads can hit an upstream timeout. Split large
+# Code-Interpreter-only files into small, independently valid ZIP transport
+# shards and expand their cached IDs when building the response request.
+LARGE_FILE_SHARD_THRESHOLD_BYTES = _positive_mb_env(
+    "APP_LARGE_FILE_SHARD_THRESHOLD_MB", 32
+)
+LARGE_FILE_SHARD_BYTES = _positive_mb_env("APP_LARGE_FILE_SHARD_MB", 16)
+SHARDED_FILE_PREFIX = "chat-shards-v1:"
+SHARD_MANIFEST_NAME = "README_REASSEMBLE_FIRST.txt"
+
+
+def _encode_sharded_file(*, original_name: str, file_ids: list[str], shard_names: list[str]) -> str:
+    payload = json.dumps(
+        {"original_name": original_name, "file_ids": file_ids, "shard_names": shard_names},
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    token = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    return SHARDED_FILE_PREFIX + token
+
+
+def _decode_sharded_file(value: str) -> dict[str, Any] | None:
+    if not isinstance(value, str) or not value.startswith(SHARDED_FILE_PREFIX):
+        return None
+    token = value[len(SHARDED_FILE_PREFIX):]
+    try:
+        token += "=" * (-len(token) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8"))
+    except Exception:
+        return None
+    ids = payload.get("file_ids")
+    names = payload.get("shard_names")
+    original = payload.get("original_name")
+    if not isinstance(ids, list) or not ids or not all(isinstance(x, str) and x for x in ids):
+        return None
+    if not isinstance(names, list) or len(names) != len(ids) or not all(isinstance(x, str) and x for x in names):
+        return None
+    if not isinstance(original, str) or not original:
+        return None
+    return {"original_name": original, "file_ids": ids, "shard_names": names}
+
+
+def _shard_manifest(original_name: str, shard_names: list[str]) -> str:
+    ordered = "\n".join(f"  {i+1}. {name}" for i, name in enumerate(shard_names))
+    return (
+        "CHAT FRONTEND TRANSPORT SHARDS\n\n"
+        f"The original attachment {original_name!r} was too large for one reliable Azure Files upload. "
+        "It was split byte-for-byte across the ZIP transport shards listed below.\n\n"
+        f"{ordered}\n\n"
+        "Before using the original attachment, reconstruct it in Code Interpreter by opening each shard ZIP "
+        "in the order above, reading the single file whose name starts with 'payload-', concatenating those "
+        "bytes, and writing them to a new file with the original filename. Do not treat the payload chunks "
+        "as the contents of the original ZIP. After reconstruction, open/use the reconstructed original normally.\n"
+    )
+
+
+def _standard_file_upload(client: Any, file_value: Any, filename: str) -> Any:
+    return client.files.create(file=(filename, file_value), purpose="assistants")
+
+
+def _upload_file_as_shards(client: Any, file_path: Path, original_name: str) -> str:
+    safe_name = Path(original_name).name or file_path.name or "attachment.bin"
+    size = file_path.stat().st_size
+    count = max(1, (size + LARGE_FILE_SHARD_BYTES - 1) // LARGE_FILE_SHARD_BYTES)
+    shard_names = [
+        safe_name if index == 0 else f"{safe_name}.part{index + 1:03d}.zip"
+        for index in range(count)
+    ]
+    manifest = _shard_manifest(safe_name, shard_names)
+    uploaded_ids: list[str] = []
+    try:
+        with file_path.open("rb") as source:
+            for index, shard_name in enumerate(shard_names):
+                chunk = source.read(LARGE_FILE_SHARD_BYTES)
+                if not chunk:
+                    raise RuntimeError(f"Unexpected end of file while sharding {safe_name}")
+                with tempfile.SpooledTemporaryFile(max_size=LARGE_FILE_SHARD_BYTES + 1024 * 1024) as archive:
+                    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as bundle:
+                        bundle.writestr(SHARD_MANIFEST_NAME, manifest)
+                        bundle.writestr(f"payload-{index + 1:03d}-of-{count:03d}.bin", chunk)
+                    archive.seek(0)
+                    uploaded = _standard_file_upload(client, archive, shard_name)
+                file_id = _value(uploaded, "id")
+                if not file_id:
+                    raise RuntimeError(f"Azure returned no file ID for shard {shard_name}")
+                uploaded_ids.append(str(file_id))
+            if source.read(1):
+                raise RuntimeError(f"File changed while sharding {safe_name}")
+    except Exception:
+        for file_id in uploaded_ids:
+            try:
+                client.files.delete(file_id)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Could not delete partial shard upload %s", file_id, exc_info=True
+                )
+        raise
+    return _encode_sharded_file(original_name=safe_name, file_ids=uploaded_ids, shard_names=shard_names)
+
+
 def supports_context_stuffing(filename: str) -> bool:
     """Return whether Azure accepts this file as a normal input_file."""
     return Path(filename).suffix.lower() in CONTEXT_STUFFING_EXTENSIONS
@@ -123,31 +234,58 @@ def make_client(endpoint: EndpointConfig) -> Any:
     )
 
 
+def _without_retries(client: Any) -> Any:
+    """Return a zero-retry SDK view when supported.
+
+    Retrying an ambiguous file POST can repeat a large upload several times and
+    turn one provider timeout into minutes of waiting. Response requests already
+    use the same no-automatic-retry rule.
+    """
+    with_options = getattr(client, "with_options", None)
+    if callable(with_options):
+        return with_options(max_retries=0)
+    return client
+
+
+def _value(value: Any, name: str) -> Any:
+    return value.get(name) if isinstance(value, dict) else getattr(value, name, None)
+
+
 def upload_file(
     endpoint: EndpointConfig,
     file_path: Path,
     original_name: str,
 ) -> str:
     client = make_client(endpoint)
+    upload_client = _without_retries(client)
     try:
-        with file_path.open("rb") as handle:
-            uploaded = client.files.create(
-                file=(original_name, handle),
-                purpose="assistants",
+        # Sharding is only for files that are supplied to Code Interpreter, not
+        # files that must be passed as a direct input_file to the model.
+        if (
+            file_path.stat().st_size >= LARGE_FILE_SHARD_THRESHOLD_BYTES
+            and not supports_context_stuffing(original_name)
+        ):
+            return _upload_file_as_shards(upload_client, file_path, original_name)
+
+        try:
+            with file_path.open("rb") as handle:
+                uploaded = _standard_file_upload(upload_client, handle, original_name)
+        except Exception as exc:
+            if not _is_invalid_extension_error(exc):
+                raise
+            uploaded = _upload_file_as_archive(
+                upload_client,
+                file_path,
+                original_name,
             )
-    except Exception as exc:
-        if not _is_invalid_extension_error(exc):
-            raise
-        uploaded = _upload_file_as_archive(
-            client,
-            file_path,
-            original_name,
-        )
+        file_id = _value(uploaded, "id")
+        if not file_id:
+            raise RuntimeError(f"Azure returned no file ID for {original_name}")
+        return str(file_id)
     finally:
         close = getattr(client, "close", None)
         if callable(close):
             close()
-    return uploaded.id
 
 
 def _is_invalid_extension_error(exc: Exception) -> bool:
@@ -254,6 +392,26 @@ def build_response_arguments(
     previous_response_id: str | None,
     stream: bool = False,
 ) -> dict[str, Any]:
+    expanded_provider_file_ids: list[str] = []
+    sharded_files: list[dict[str, Any]] = []
+    for provider_file_id in provider_file_ids:
+        shard = _decode_sharded_file(provider_file_id)
+        if shard is None:
+            expanded_provider_file_ids.append(provider_file_id)
+        else:
+            expanded_provider_file_ids.extend(shard["file_ids"])
+            sharded_files.append(shard)
+
+    if sharded_files:
+        names = ", ".join(repr(item["original_name"]) for item in sharded_files)
+        transport_note = (
+            "Some attached files were transport-sharded because they were too large for one reliable upload: "
+            + names
+            + ". In Code Interpreter, inspect README_REASSEMBLE_FIRST.txt inside the corresponding shard ZIPs "
+              "and reconstruct each original file before using it. The shard payloads are byte slices of the original file."
+        )
+        instructions = (instructions.strip() + "\n\n" + transport_note).strip()
+
     arguments: dict[str, Any] = {
         "model": model.deployment,
         "input": input_payload,
@@ -275,7 +433,7 @@ def build_response_arguments(
 
     tools: list[dict[str, Any]] = []
     if use_code_interpreter:
-        provider_file_ids = list(dict.fromkeys(provider_file_ids))
+        provider_file_ids = list(dict.fromkeys(expanded_provider_file_ids))
         if len(provider_file_ids) > MAX_CONTAINER_FILES:
             raise ValueError("Code Interpreter accepts at most 50 file IDs. Bundle the files before submitting.")
         container: dict[str, Any] = {"type": "auto"}
